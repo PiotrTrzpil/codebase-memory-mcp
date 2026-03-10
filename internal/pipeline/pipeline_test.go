@@ -790,13 +790,16 @@ func TestPipelineRunCancellation(t *testing.T) {
 func TestProjectNameFromPath(t *testing.T) {
 	tests := []struct{ path, want string }{
 		{"/tmp/bench/erlang/lib/stdlib/src", "tmp-bench-erlang-lib-stdlib-src"},
-		{"/Users/martin/projects/myapp", "Users-martin-projects-myapp"},
+		{"/Users/martin/projects/myapp", "users-martin-projects-myapp"},
 		{"/home/user/repo", "home-user-repo"},
 		{"/single", "single"},
 		// Windows paths (#20)
-		{"C:/Users/project", "C-Users-project"},
-		{"D:\\Projects\\myapp", "D-Projects-myapp"},
-		{"C:\\Temp\\codebase-memory-mcp", "C-Temp-codebase-memory-mcp"},
+		{"C:/Users/project", "c-users-project"},
+		{"D:\\Projects\\myapp", "d-projects-myapp"},
+		{"C:\\Temp\\codebase-memory-mcp", "c-temp-codebase-memory-mcp"},
+		// Case normalization: same repo with different OS-reported casing → same name
+		{"/Users/subuser/Code/Settlers.ts", "users-subuser-code-settlers.ts"},
+		{"/Users/subuser/Code/settlers.ts", "users-subuser-code-settlers.ts"},
 	}
 	for _, tt := range tests {
 		got := ProjectNameFromPath(tt.path)
@@ -863,5 +866,65 @@ func TestFORMProcedureCallResolution(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected a CALLS edge from caller to callee, got none")
+	}
+}
+
+// --- cleanBaseClassNames tests ---
+
+func TestCleanBaseClassNames_Implements(t *testing.T) {
+	names := cleanBaseClassNames("implements Feature")
+	if len(names) != 1 || names[0] != "Feature" {
+		t.Errorf("expected [Feature], got %v", names)
+	}
+}
+
+func TestCleanBaseClassNames_ImplementsMultiple(t *testing.T) {
+	names := cleanBaseClassNames("implements Feature, Serializable, Comparable")
+	if len(names) != 3 {
+		t.Fatalf("expected 3 names, got %d: %v", len(names), names)
+	}
+	expected := []string{"Feature", "Serializable", "Comparable"}
+	for i, want := range expected {
+		if names[i] != want {
+			t.Errorf("names[%d] = %q, want %q", i, names[i], want)
+		}
+	}
+}
+
+func TestCleanBaseClassNames_Extends(t *testing.T) {
+	names := cleanBaseClassNames("extends BaseComponent")
+	if len(names) != 1 || names[0] != "BaseComponent" {
+		t.Errorf("expected [BaseComponent], got %v", names)
+	}
+}
+
+func TestCleanBaseClassNames_BareName(t *testing.T) {
+	// Already a clean name — should pass through unchanged
+	names := cleanBaseClassNames("Feature")
+	if len(names) != 1 || names[0] != "Feature" {
+		t.Errorf("expected [Feature], got %v", names)
+	}
+}
+
+func TestCleanBaseClassNames_WithGenerics(t *testing.T) {
+	names := cleanBaseClassNames("implements Comparable<T>, Iterable<U>")
+	if len(names) != 2 {
+		t.Fatalf("expected 2 names, got %d: %v", len(names), names)
+	}
+	if names[0] != "Comparable" {
+		t.Errorf("names[0] = %q, want Comparable", names[0])
+	}
+	if names[1] != "Iterable" {
+		t.Errorf("names[1] = %q, want Iterable", names[1])
+	}
+}
+
+func TestCleanBaseClassNames_ExtendsWithSpaces(t *testing.T) {
+	names := cleanBaseClassNames("extends  Base ,  Mixin ")
+	if len(names) != 2 {
+		t.Fatalf("expected 2 names, got %d: %v", len(names), names)
+	}
+	if names[0] != "Base" || names[1] != "Mixin" {
+		t.Errorf("expected [Base, Mixin], got %v", names)
 	}
 }

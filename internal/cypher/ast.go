@@ -80,6 +80,11 @@ type PropertyExpr struct {
 
 func (*PropertyExpr) exprNode() {}
 
+// VariableExpr is a bare variable reference (e.g. f in RETURN f).
+type VariableExpr struct{ Variable string }
+
+func (*VariableExpr) exprNode() {}
+
 // LiteralExpr is a string or numeric literal.
 type LiteralExpr struct{ Value string }
 
@@ -116,4 +121,5 @@ type ReturnItem struct {
 	Property string // "name" (empty = return whole node)
 	Alias    string // "AS call_count" (optional)
 	Func     string // "COUNT" (optional aggregation)
+	Expr     Expr   // expression (non-nil for arithmetic like f.end_line - f.start_line)
 }

@@ -14,6 +14,60 @@ import (
 
 const maxResultRows = 200
 
+// labelAliases maps user-facing labels to all concrete labels they should match.
+// e.g. "Function" matches both standalone functions and class methods.
+// labelAliases maps user-facing labels to all concrete labels they should match.
+// e.g. "Function" matches both standalone functions and class methods.
+var labelAliases = map[string][]string{
+	"Function": {"Function", "Method"},
+	"Callable": {"Function", "Method"},
+}
+
+// buildLabelClause builds a SQL label filter clause with alias expansion.
+// Returns the clause string and updated args slice.
+func buildLabelClause(tableAlias, label string, args []any) (string, []any) {
+	if aliases := labelAliases[label]; len(aliases) > 0 {
+		ph := make([]string, len(aliases))
+		for i, a := range aliases {
+			ph[i] = "?"
+			args = append(args, a)
+		}
+		return " AND " + tableAlias + ".label IN (" + strings.Join(ph, ",") + ")", args
+	}
+	args = append(args, label)
+	return " AND " + tableAlias + ".label = ?", args
+}
+
+// exprString returns a human-readable string for an expression (used as column name).
+func exprString(expr Expr) string {
+	switch ex := expr.(type) {
+	case *PropertyExpr:
+		return ex.Variable + "." + ex.Property
+	case *VariableExpr:
+		return ex.Variable
+	case *LiteralExpr:
+		return ex.Value
+	case *ArithExpr:
+		return exprString(ex.Left) + " " + ex.Op + " " + exprString(ex.Right)
+	default:
+		return "expr"
+	}
+}
+
+// labelMatches checks whether a node's actual label matches the requested label,
+// accounting for label aliases (e.g. "Function" matches "Method").
+func labelMatches(actual, requested string) bool {
+	if actual == requested {
+		return true
+	}
+	for _, alias := range labelAliases[requested] {
+		if actual == alias {
+			return true
+		}
+	}
+	return false
+}
+
 // Executor runs Cypher execution plans against a store.
 type Executor struct {
 	Store      *store.Store
@@ -327,14 +381,16 @@ func buildProjectAggregateSQL(
 	}
 	sb.WriteString(" AND e.type IN (" + strings.Join(typePlaceholders, ",") + ")")
 
-	// Label filters
+	// Label filters (with alias expansion)
 	if scan.Label != "" {
-		fmt.Fprintf(&sb, " AND %s.label = ?", ctx.srcAlias)
-		args = append(args, scan.Label)
+		var clause string
+		clause, args = buildLabelClause(ctx.srcAlias, scan.Label, args)
+		sb.WriteString(clause)
 	}
 	if expand.ToLabel != "" {
-		fmt.Fprintf(&sb, " AND %s.label = ?", ctx.tgtAlias)
-		args = append(args, expand.ToLabel)
+		var clause string
+		clause, args = buildLabelClause(ctx.tgtAlias, expand.ToLabel, args)
+		sb.WriteString(clause)
 	}
 
 	// Push-down WHERE conditions
@@ -488,15 +544,13 @@ func (e *Executor) execJoinScanExpand(project string, scan *ScanNodes, expand *E
 		srcCol, tgtCol = "target_id", "source_id"
 	}
 
-	// Build label filters
+	// Build label filters (with alias expansion)
 	var srcLabelClause, tgtLabelClause string
 	if scan.Label != "" {
-		srcLabelClause = " AND src.label = ?"
-		args = append(args, scan.Label)
+		srcLabelClause, args = buildLabelClause("src", scan.Label, args)
 	}
 	if expand.ToLabel != "" {
-		tgtLabelClause = " AND tgt.label = ?"
-		args = append(args, expand.ToLabel)
+		tgtLabelClause, args = buildLabelClause("tgt", expand.ToLabel, args)
 	}
 
 	query := fmt.Sprintf(`
@@ -566,6 +620,7 @@ var sqlPushableColumns = map[string]string{
 	"name":           "name",
 	"qualified_name": "qualified_name",
 	"label":          "label",
+	"file":           "file_path",
 	"file_path":      "file_path",
 }
 
@@ -575,8 +630,21 @@ func (e *Executor) execScan(project string, s *ScanNodes, pushDown *FilterWhere)
 	args := []any{project}
 
 	if s.Label != "" {
-		query += " AND label=?"
-		args = append(args, s.Label)
+		if aliases := labelAliases[s.Label]; len(aliases) > 0 {
+			ph := make([]string, len(aliases))
+			for i, a := range aliases {
+				ph[i] = "?"
+				args = append(args, a)
+			}
+			query += " AND label IN (" + strings.Join(ph, ",") + ")"
+		} else {
+			query += " AND label=?"
+			args = append(args, s.Label)
+		}
+	} else {
+		// Exclude internal graph nodes from unlabeled scans — Community nodes
+		// are pipeline artifacts, not user-facing structural nodes.
+		query += " AND label != 'Community'"
 	}
 
 	// Push down WHERE conditions into SQL where possible
@@ -807,7 +875,7 @@ func buildExpandedBindings(bindings []binding, s *ExpandRelationship, edgesByNod
 			seen[targetID] = true
 
 			node, exists := nodeMap[targetID]
-			if !exists || (s.ToLabel != "" && node.Label != s.ToLabel) {
+			if !exists || (s.ToLabel != "" && !labelMatches(node.Label, s.ToLabel)) {
 				continue
 			}
 			if len(s.ToProps) > 0 && !nodeMatchesProps(node, s.ToProps) {
@@ -860,7 +928,7 @@ func (e *Executor) expandVariableLength(b binding, fromNode *store.Node, s *Expa
 		if s.MaxHops > 0 && nh.Hop > s.MaxHops {
 			continue
 		}
-		if s.ToLabel != "" && nh.Node.Label != s.ToLabel {
+		if s.ToLabel != "" && !labelMatches(nh.Node.Label, s.ToLabel) {
 			continue
 		}
 		if len(s.ToProps) > 0 && !nodeMatchesProps(nh.Node, s.ToProps) {
@@ -1011,6 +1079,14 @@ func (e *Executor) evalExpr(b binding, expr Expr) (any, error) {
 			return f, nil
 		}
 		return ex.Value, nil
+	case *VariableExpr:
+		if node, ok := b.nodes[ex.Variable]; ok {
+			return resolveNodeItemValue(node, ""), nil
+		}
+		if edge, ok := b.edges[ex.Variable]; ok {
+			return resolveEdgeItemValue(edge, ""), nil
+		}
+		return nil, nil
 	case *PropertyExpr:
 		if node, ok := b.nodes[ex.Variable]; ok {
 			return getNodeProperty(node, ex.Property), nil
@@ -1275,7 +1351,7 @@ func getNodeProperty(n *store.Node, prop string) any {
 		return n.QualifiedName
 	case "label":
 		return n.Label
-	case "file_path":
+	case "file", "file_path":
 		return n.FilePath
 	case "start_line":
 		return n.StartLine
@@ -1389,7 +1465,7 @@ func (e *Executor) simpleProjection(bindings []binding, ret *ReturnClause) (*Res
 	seen := make(map[string]bool)
 	rows := make([]map[string]any, 0, len(bindings))
 	for _, b := range bindings {
-		row := buildProjectionRow(b, ret.Items, cols)
+		row := buildProjectionRow(b, ret.Items, cols, e)
 
 		// DISTINCT check
 		if ret.Distinct {
@@ -1420,7 +1496,9 @@ func buildColumnNames(items []ReturnItem) []string {
 	cols := make([]string, 0, len(items))
 	for _, item := range items {
 		col := item.Variable
-		if item.Property != "" {
+		if item.Expr != nil {
+			col = exprString(item.Expr)
+		} else if item.Property != "" {
 			col = item.Variable + "." + item.Property
 		}
 		if item.Alias != "" {
@@ -1432,16 +1510,24 @@ func buildColumnNames(items []ReturnItem) []string {
 }
 
 // buildProjectionRow builds a single result row from a binding.
-func buildProjectionRow(b binding, items []ReturnItem, cols []string) map[string]any {
+func buildProjectionRow(b binding, items []ReturnItem, cols []string, exec *Executor) map[string]any {
 	row := make(map[string]any)
 	for i, item := range items {
-		row[cols[i]] = resolveItemValue(b, item)
+		row[cols[i]] = resolveItemValue(b, item, exec)
 	}
 	return row
 }
 
 // resolveItemValue resolves a return item value from a binding (node or edge).
-func resolveItemValue(b binding, item ReturnItem) any {
+func resolveItemValue(b binding, item ReturnItem, exec *Executor) any {
+	// Expression-based return items (arithmetic etc.)
+	if item.Expr != nil {
+		val, err := exec.evalExpr(b, item.Expr)
+		if err != nil {
+			return nil
+		}
+		return val
+	}
 	if node, ok := b.nodes[item.Variable]; ok {
 		return resolveNodeItemValue(node, item.Property)
 	}
@@ -1521,7 +1607,7 @@ func applyLimit(rows []map[string]any, limit int) []map[string]any {
 
 func (e *Executor) aggregateResults(bindings []binding, ret *ReturnClause) (*Result, error) {
 	groupItems, countItem := splitAggregateItems(ret.Items)
-	groups, order := buildGroups(bindings, groupItems)
+	groups, order := buildGroups(bindings, groupItems, e)
 
 	// Build columns
 	cols := buildColumnNames(ret.Items)
@@ -1571,7 +1657,7 @@ type groupEntry struct {
 }
 
 // buildGroups groups bindings by non-COUNT items and counts occurrences.
-func buildGroups(bindings []binding, groupItems []ReturnItem) (groups map[string]*groupEntry, order []string) {
+func buildGroups(bindings []binding, groupItems []ReturnItem, exec *Executor) (groups map[string]*groupEntry, order []string) {
 	groups = make(map[string]*groupEntry)
 
 	for _, b := range bindings {
@@ -1585,7 +1671,7 @@ func buildGroups(bindings []binding, groupItems []ReturnItem) (groups map[string
 			if item.Alias != "" {
 				col = item.Alias
 			}
-			val := resolveItemValue(b, item)
+			val := resolveItemValue(b, item, exec)
 			row[col] = val
 			keyParts = append(keyParts, fmt.Sprintf("%v", val))
 		}

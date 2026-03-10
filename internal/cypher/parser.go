@@ -3,6 +3,7 @@ package cypher
 import (
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // Parser converts a token stream into an AST.
@@ -537,6 +538,11 @@ func (p *Parser) parsePrimaryExpr() (Expr, error) {
 		return p.parseListLiteral()
 	case TokIdent:
 		p.advance()
+		// Boolean literals: true/false (case-insensitive)
+		lower := strings.ToLower(tok.Value)
+		if lower == "true" || lower == "false" || lower == "null" {
+			return &LiteralExpr{Value: lower}, nil
+		}
 		if p.peek().Type == TokDot {
 			p.advance() // consume '.'
 			propTok := p.advance()
@@ -662,20 +668,22 @@ func (p *Parser) parseReturnItem() (ReturnItem, error) {
 		return p.parseCountItem()
 	}
 
-	// variable or variable.property
-	varTok := p.advance()
-	if varTok.Type != TokIdent {
-		return item, fmt.Errorf("expected variable in RETURN item, got %q at pos %d", varTok.Value, varTok.Pos)
+	// Try parsing as a full expression (supports arithmetic like f.end_line - f.start_line)
+	expr, err := p.parseReturnExpr()
+	if err != nil {
+		return item, err
 	}
-	item.Variable = varTok.Value
 
-	if p.peek().Type == TokDot {
-		p.advance() // consume .
-		propTok := p.advance()
-		if propTok.Type != TokIdent {
-			return item, fmt.Errorf("expected property after '.', got %q", propTok.Value)
-		}
-		item.Property = propTok.Value
+	// If it's a simple property access, keep backward-compatible fields
+	switch ex := expr.(type) {
+	case *PropertyExpr:
+		item.Variable = ex.Variable
+		item.Property = ex.Property
+	case *VariableExpr:
+		item.Variable = ex.Variable
+	default:
+		// Complex expression (arithmetic etc.) — store as Expr
+		item.Expr = expr
 	}
 
 	// Optional AS alias
@@ -689,6 +697,50 @@ func (p *Parser) parseReturnItem() (ReturnItem, error) {
 	}
 
 	return item, nil
+}
+
+// parseReturnExpr parses an expression in RETURN context, allowing bare variables.
+func (p *Parser) parseReturnExpr() (Expr, error) {
+	left, err := p.parseReturnPrimaryExpr()
+	if err != nil {
+		return nil, err
+	}
+	for p.peek().Type == TokPlus || p.peek().Type == TokDash || p.peek().Type == TokStar {
+		opTok := p.advance()
+		right, err := p.parseReturnPrimaryExpr()
+		if err != nil {
+			return nil, err
+		}
+		left = &ArithExpr{Left: left, Op: opTok.Value, Right: right}
+	}
+	return left, nil
+}
+
+// parseReturnPrimaryExpr is like parsePrimaryExpr but allows bare variables (for RETURN f).
+func (p *Parser) parseReturnPrimaryExpr() (Expr, error) {
+	tok := p.peek()
+	switch tok.Type {
+	case TokNumber:
+		p.advance()
+		return &LiteralExpr{Value: tok.Value}, nil
+	case TokString:
+		p.advance()
+		return &LiteralExpr{Value: tok.Value}, nil
+	case TokIdent:
+		p.advance()
+		if p.peek().Type == TokDot {
+			p.advance() // consume '.'
+			propTok := p.advance()
+			if propTok.Type != TokIdent {
+				return nil, fmt.Errorf("expected property name after '.', got %s %q at position %d", propTok.Type, propTok.Value, propTok.Pos)
+			}
+			return &PropertyExpr{Variable: tok.Value, Property: propTok.Value}, nil
+		}
+		// Bare variable (e.g. RETURN f)
+		return &VariableExpr{Variable: tok.Value}, nil
+	default:
+		return nil, fmt.Errorf("expected variable or expression in RETURN item, got %s %q at position %d", tok.Type, tok.Value, tok.Pos)
+	}
 }
 
 // parseCountItem parses a COUNT(variable) [AS alias] expression.

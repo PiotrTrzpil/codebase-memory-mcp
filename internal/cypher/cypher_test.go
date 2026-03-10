@@ -1289,6 +1289,200 @@ func TestExecuteMixedAndOr(t *testing.T) {
 	}
 }
 
+// --- Boolean literal tests (BUG 6) ---
+
+func TestParseBooleanLiteral(t *testing.T) {
+	q, err := Parse(`MATCH (f:Function) WHERE f.is_exported = true RETURN f.name`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if q.Where == nil {
+		t.Fatal("expected WHERE clause")
+	}
+	c := q.Where.Conditions[0]
+	if c.Operator != "=" {
+		t.Errorf("expected '=', got %q", c.Operator)
+	}
+	lit, ok := c.RHS.(*LiteralExpr)
+	if !ok {
+		t.Fatalf("expected *LiteralExpr as RHS, got %T", c.RHS)
+	}
+	if lit.Value != "true" {
+		t.Errorf("expected 'true', got %q", lit.Value)
+	}
+}
+
+func TestParseBooleanLiteralFalse(t *testing.T) {
+	q, err := Parse(`MATCH (f:Function) WHERE f.is_exported = false RETURN f.name`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	c := q.Where.Conditions[0]
+	lit, ok := c.RHS.(*LiteralExpr)
+	if !ok {
+		t.Fatalf("expected *LiteralExpr, got %T", c.RHS)
+	}
+	if lit.Value != "false" {
+		t.Errorf("expected 'false', got %q", lit.Value)
+	}
+}
+
+func TestExecuteBooleanLiteral(t *testing.T) {
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+	s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "Exported",
+		QualifiedName: "test.Exported", FilePath: "a.go",
+		Properties: map[string]any{"is_exported": true},
+	})
+	s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "Private",
+		QualifiedName: "test.Private", FilePath: "a.go",
+		Properties: map[string]any{"is_exported": false},
+	})
+
+	exec := &Executor{Store: s}
+
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.is_exported = true RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["f.name"] != "Exported" {
+		t.Errorf("expected 'Exported', got %v", result.Rows[0]["f.name"])
+	}
+
+	result2, err := exec.Execute(`MATCH (f:Function) WHERE f.is_exported = false RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result2.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result2.Rows))
+	}
+	if result2.Rows[0]["f.name"] != "Private" {
+		t.Errorf("expected 'Private', got %v", result2.Rows[0]["f.name"])
+	}
+}
+
+func TestParseNullLiteral(t *testing.T) {
+	q, err := Parse(`MATCH (f:Function) WHERE f.docstring = null RETURN f.name`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	c := q.Where.Conditions[0]
+	lit, ok := c.RHS.(*LiteralExpr)
+	if !ok {
+		t.Fatalf("expected *LiteralExpr, got %T", c.RHS)
+	}
+	if lit.Value != "null" {
+		t.Errorf("expected 'null', got %q", lit.Value)
+	}
+}
+
+// --- file property alias tests (BUG 4) ---
+
+func TestExecuteFileAlias(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.name = "HandleOrder" RETURN f.name, f.file`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["f.file"] != "main.go" {
+		t.Errorf("f.file = %v, want main.go", result.Rows[0]["f.file"])
+	}
+}
+
+func TestExecuteFileAliasInWhere(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.file ENDS WITH ".go" RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 4 {
+		t.Errorf("expected 4 rows (all .go files), got %d", len(result.Rows))
+	}
+}
+
+// --- Case-insensitive regex tests (BUG 5 verification) ---
+
+func TestExecuteRegexCaseInsensitive(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// (?i) flag should match case-insensitively
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.name =~ '(?i).*order' RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// HandleOrder, ValidateOrder, SubmitOrder all end with "Order" (mixed case)
+	if len(result.Rows) != 3 {
+		t.Errorf("expected 3 rows with (?i) regex, got %d", len(result.Rows))
+	}
+}
+
+// --- Community node exclusion tests (BUG 2/3) ---
+
+func TestCommunityNodesExcludedFromUnlabeledScan(t *testing.T) {
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "Foo",
+		QualifiedName: "test.Foo", FilePath: "a.go",
+	})
+	s.UpsertNode(&store.Node{
+		Project: "test", Label: "Community", Name: "Foo_cluster",
+		QualifiedName: "test.__community__.0",
+	})
+
+	exec := &Executor{Store: s}
+
+	// Unlabeled scan should NOT return Community nodes
+	result, err := exec.Execute(`MATCH (f) RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	for _, row := range result.Rows {
+		name, _ := row["f.name"].(string)
+		if strings.HasSuffix(name, "_cluster") {
+			t.Errorf("Community node %q should be excluded from unlabeled scan", name)
+		}
+	}
+
+	// Explicit Community label should still work
+	result2, err := exec.Execute(`MATCH (c:Community) RETURN c.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result2.Rows) != 1 {
+		t.Errorf("expected 1 Community node with explicit label, got %d", len(result2.Rows))
+	}
+}
+
 func TestExecuteMixedAndOrPrecedence(t *testing.T) {
 	s := setupTestStore(t)
 	defer s.Close()
@@ -1302,5 +1496,334 @@ func TestExecuteMixedAndOrPrecedence(t *testing.T) {
 	}
 	if len(result.Rows) != 2 {
 		t.Fatalf("expected 2 rows, got %d: %v", len(result.Rows), result.Rows)
+	}
+}
+
+// --- Label alias tests (Function matches Method) ---
+
+// setupTestStoreWithMethods creates a store with both Function and Method nodes.
+func setupTestStoreWithMethods(t *testing.T) *store.Store {
+	t.Helper()
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatalf("open memory store: %v", err)
+	}
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+
+	// Functions (top-level)
+	idA, _ := s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "createGameState",
+		QualifiedName: "test.game.createGameState", FilePath: "game.ts",
+		StartLine: 1, EndLine: 20,
+	})
+	s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "saveGameState",
+		QualifiedName: "test.game.saveGameState", FilePath: "game.ts",
+		StartLine: 25, EndLine: 40,
+	})
+
+	// Methods (class methods)
+	idDraw, _ := s.UpsertNode(&store.Node{
+		Project: "test", Label: "Method", Name: "draw",
+		QualifiedName: "test.renderer.Renderer.draw", FilePath: "renderer.ts",
+		StartLine: 10, EndLine: 80,
+	})
+	s.UpsertNode(&store.Node{
+		Project: "test", Label: "Method", Name: "registerEvents",
+		QualifiedName: "test.input.InputManager.registerEvents", FilePath: "input.ts",
+		StartLine: 5, EndLine: 45,
+	})
+	s.UpsertNode(&store.Node{
+		Project: "test", Label: "Method", Name: "fillSpriteQuadPartial",
+		QualifiedName: "test.renderer.Renderer.fillSpriteQuadPartial", FilePath: "renderer.ts",
+		StartLine: 85, EndLine: 200,
+	})
+
+	// Class that owns methods
+	idClass, _ := s.UpsertNode(&store.Node{
+		Project: "test", Label: "Class", Name: "Renderer",
+		QualifiedName: "test.renderer.Renderer", FilePath: "renderer.ts",
+	})
+
+	// Edges
+	mustInsertEdge(t, s, &store.Edge{Project: "test", SourceID: idClass, TargetID: idDraw, Type: "DEFINES_METHOD"})
+	mustInsertEdge(t, s, &store.Edge{Project: "test", SourceID: idA, TargetID: idDraw, Type: "CALLS"})
+
+	return s
+}
+
+func TestLabelMatchesHelper(t *testing.T) {
+	if !labelMatches("Function", "Function") {
+		t.Error("Function should match Function")
+	}
+	if !labelMatches("Method", "Function") {
+		t.Error("Method should match Function via alias")
+	}
+	if labelMatches("Class", "Function") {
+		t.Error("Class should NOT match Function")
+	}
+	if !labelMatches("Method", "Callable") {
+		t.Error("Method should match Callable")
+	}
+	if labelMatches("Method", "Method") {
+		// Method is not in labelAliases, so exact match only
+	}
+}
+
+func TestFunctionLabelMatchesMethods(t *testing.T) {
+	s := setupTestStoreWithMethods(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+
+	// :Function should match both Function and Method nodes
+	result, err := exec.Execute(`MATCH (f:Function) RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// 2 Functions + 3 Methods = 5
+	if len(result.Rows) != 5 {
+		t.Fatalf("expected 5 results (2 Functions + 3 Methods), got %d: %v", len(result.Rows), result.Rows)
+	}
+}
+
+func TestFunctionLabelWithINClause(t *testing.T) {
+	s := setupTestStoreWithMethods(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+
+	// The original bug: IN on :Function should find methods too
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.name IN ["draw", "registerEvents", "fillSpriteQuadPartial"] RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("expected 3 results, got %d: %v", len(result.Rows), result.Rows)
+	}
+	names := make(map[string]bool)
+	for _, row := range result.Rows {
+		names[row["f.name"].(string)] = true
+	}
+	for _, expected := range []string{"draw", "registerEvents", "fillSpriteQuadPartial"} {
+		if !names[expected] {
+			t.Errorf("missing expected method %q", expected)
+		}
+	}
+}
+
+func TestMethodLabelStillWorksExactly(t *testing.T) {
+	s := setupTestStoreWithMethods(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+
+	// :Method should match only Method nodes
+	result, err := exec.Execute(`MATCH (m:Method) RETURN m.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("expected 3 Methods only, got %d: %v", len(result.Rows), result.Rows)
+	}
+}
+
+func TestFunctionLabelInRelationshipExpand(t *testing.T) {
+	s := setupTestStoreWithMethods(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+
+	// Expanding to :Function target should also match Method nodes
+	result, err := exec.Execute(`MATCH (f:Function)-[:CALLS]->(g:Function) RETURN f.name, g.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row (createGameState->draw), got %d: %v", len(result.Rows), result.Rows)
+	}
+	if result.Rows[0]["g.name"] != "draw" {
+		t.Errorf("expected g.name=draw, got %v", result.Rows[0]["g.name"])
+	}
+}
+
+func TestCallableLabelAlias(t *testing.T) {
+	s := setupTestStoreWithMethods(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+
+	// :Callable is an alias for Function+Method
+	result, err := exec.Execute(`MATCH (f:Callable) RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 5 {
+		t.Fatalf("expected 5 Callable results, got %d", len(result.Rows))
+	}
+}
+
+// --- Arithmetic in RETURN tests ---
+
+func TestParseReturnArithmetic(t *testing.T) {
+	q, err := Parse(`MATCH (f:Function) RETURN f.end_line - f.start_line AS lines`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(q.Return.Items) != 1 {
+		t.Fatalf("expected 1 return item, got %d", len(q.Return.Items))
+	}
+	item := q.Return.Items[0]
+	if item.Expr == nil {
+		t.Fatal("expected Expr to be set for arithmetic return item")
+	}
+	arith, ok := item.Expr.(*ArithExpr)
+	if !ok {
+		t.Fatalf("expected ArithExpr, got %T", item.Expr)
+	}
+	if arith.Op != "-" {
+		t.Errorf("expected '-', got %q", arith.Op)
+	}
+	if item.Alias != "lines" {
+		t.Errorf("expected alias 'lines', got %q", item.Alias)
+	}
+}
+
+func TestExecuteReturnArithmetic(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// HandleOrder: end_line=30, start_line=10, diff=20
+	// ValidateOrder: end_line=20, start_line=5, diff=15
+	// SubmitOrder: end_line=50, start_line=25, diff=25
+	// LogError: end_line=5, start_line=1, diff=4
+	result, err := exec.Execute(`MATCH (f:Function) RETURN f.name, f.end_line - f.start_line AS lines ORDER BY lines DESC LIMIT 2`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %v", len(result.Rows), result.Rows)
+	}
+
+	// First row should be SubmitOrder with 25 lines
+	row0 := result.Rows[0]
+	if row0["f.name"] != "SubmitOrder" {
+		t.Errorf("expected first row SubmitOrder, got %v", row0["f.name"])
+	}
+	lines0, ok := row0["lines"].(float64)
+	if !ok {
+		t.Fatalf("expected lines to be float64, got %T (%v)", row0["lines"], row0["lines"])
+	}
+	if lines0 != 25 {
+		t.Errorf("expected 25 lines for SubmitOrder, got %v", lines0)
+	}
+
+	// Second row should be HandleOrder with 20 lines
+	row1 := result.Rows[1]
+	if row1["f.name"] != "HandleOrder" {
+		t.Errorf("expected second row HandleOrder, got %v", row1["f.name"])
+	}
+	lines1 := row1["lines"].(float64)
+	if lines1 != 20 {
+		t.Errorf("expected 20 lines for HandleOrder, got %v", lines1)
+	}
+}
+
+func TestExecuteReturnArithmeticNoAlias(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// Without AS alias, column name should be the expression string
+	result, err := exec.Execute(`MATCH (f:Function) RETURN f.name, f.end_line - f.start_line LIMIT 1`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+
+	// Check that the expression column exists
+	found := false
+	for _, col := range result.Columns {
+		if col == "f.end_line - f.start_line" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected column 'f.end_line - f.start_line' in columns: %v", result.Columns)
+	}
+}
+
+func TestExecuteReturnAddition(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.name = "HandleOrder" RETURN f.start_line + f.end_line AS total`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	// HandleOrder: start_line=10, end_line=30, total=40
+	total, ok := result.Rows[0]["total"].(float64)
+	if !ok {
+		t.Fatalf("expected float64, got %T", result.Rows[0]["total"])
+	}
+	if total != 40 {
+		t.Errorf("expected 40, got %v", total)
+	}
+}
+
+func TestReturnBareVariable(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// RETURN f (bare variable) should still work
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.name = "HandleOrder" RETURN f`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	nodeMap, ok := result.Rows[0]["f"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected map for bare variable, got %T", result.Rows[0]["f"])
+	}
+	if nodeMap["name"] != "HandleOrder" {
+		t.Errorf("expected name=HandleOrder, got %v", nodeMap["name"])
+	}
+}
+
+func TestReturnMixedSimpleAndArithmetic(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// Mix simple property access and arithmetic in same RETURN
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.name = "SubmitOrder" RETURN f.name, f.file, f.end_line - f.start_line AS lines`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	row := result.Rows[0]
+	if row["f.name"] != "SubmitOrder" {
+		t.Errorf("f.name = %v, want SubmitOrder", row["f.name"])
+	}
+	if row["f.file"] != "service.go" {
+		t.Errorf("f.file = %v, want service.go", row["f.file"])
+	}
+	if lines, ok := row["lines"].(float64); !ok || lines != 25 {
+		t.Errorf("lines = %v (%T), want 25", row["lines"], row["lines"])
 	}
 }

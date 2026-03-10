@@ -305,22 +305,25 @@ func (p *Pipeline) processExplicitBases(classNode *store.Node) (linkCount, overr
 		if !ok || baseName == "" {
 			continue
 		}
-		ifaceQN := resolveAsClass(baseName, p.registry, moduleQN, importMap)
-		if ifaceQN == "" {
-			continue
+		// Clean up raw clause text from tree-sitter (e.g. "implements Feature, Serializable")
+		for _, name := range cleanBaseClassNames(baseName) {
+			ifaceQN := resolveAsClass(name, p.registry, moduleQN, importMap)
+			if ifaceQN == "" {
+				continue
+			}
+			ifaceNode, _ := p.findNodeByQN(p.ProjectName, ifaceQN)
+			if ifaceNode == nil {
+				continue
+			}
+			_ = p.insertEdge(&store.Edge{
+				Project:  p.ProjectName,
+				SourceID: classNode.ID,
+				TargetID: ifaceNode.ID,
+				Type:     "IMPLEMENTS",
+			})
+			linkCount++
+			overrideCount += p.createOverrideEdgesExplicit(classNode, ifaceNode)
 		}
-		ifaceNode, _ := p.findNodeByQN(p.ProjectName, ifaceQN)
-		if ifaceNode == nil {
-			continue
-		}
-		_ = p.insertEdge(&store.Edge{
-			Project:  p.ProjectName,
-			SourceID: classNode.ID,
-			TargetID: ifaceNode.ID,
-			Type:     "IMPLEMENTS",
-		})
-		linkCount++
-		overrideCount += p.createOverrideEdgesExplicit(classNode, ifaceNode)
 	}
 	return
 }
@@ -414,4 +417,31 @@ func (p *Pipeline) implementsRust() (linkCount, overrideCount int) {
 		}
 	}
 	return
+}
+
+// cleanBaseClassNames extracts individual class/interface names from a raw
+// tree-sitter base class string. The CBM extractor may return full clause text
+// like "implements Feature, Serializable" or "extends Base" instead of bare names.
+func cleanBaseClassNames(raw string) []string {
+	// Strip common clause keywords
+	for _, kw := range []string{"implements ", "extends ", "with "} {
+		if strings.HasPrefix(raw, kw) {
+			raw = raw[len(kw):]
+			break
+		}
+	}
+	// Split on commas for multiple base types
+	parts := strings.Split(raw, ",")
+	var names []string
+	for _, p := range parts {
+		name := strings.TrimSpace(p)
+		// Strip generic type parameters (e.g. "Comparable<T>" -> "Comparable")
+		if idx := strings.IndexByte(name, '<'); idx > 0 {
+			name = name[:idx]
+		}
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
