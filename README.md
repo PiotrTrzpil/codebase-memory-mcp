@@ -485,6 +485,16 @@ query_graph(query="MATCH (f:Function) WHERE f.name =~ '(?i).*handler.*' RETURN f
 query_graph(query="MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence LIMIT 10")
 ```
 
+```
+# Arithmetic and advanced WHERE:
+query_graph(query="MATCH (f:Function) WHERE f.end_line - f.start_line > 80 RETURN f.name, f.file_path ORDER BY f.end_line - f.start_line DESC LIMIT 20")
+```
+
+```
+# IN operator with list literals:
+query_graph(query="MATCH (f:Function) WHERE f.name IN ['main', 'init', 'setup'] RETURN f.name, f.qualified_name")
+```
+
 ### High fan-out functions (calling 10+ others)
 
 ```
@@ -543,6 +553,7 @@ search_graph(label="Function", limit=50, offset=50)
 
 - **HTTP_CALLS**: `confidence` (0.0–1.0), `url_path`, `http_method`
 - **CALLS**: `via` (e.g. `"route_registration"` for handler wiring)
+- **IMPORTS**: `via_barrel` (set when import was resolved through a barrel/index module)
 
 Edge properties are accessible in Cypher queries: `MATCH (a)-[r:HTTP_CALLS]->(b) RETURN r.confidence, r.url_path`
 
@@ -569,8 +580,12 @@ The format is: project name, file path with `/` replaced by `.` and extension re
 - `MATCH` with relationship types: `-[:CALLS]->`
 - `MATCH` with variable-length paths: `-[:CALLS*1..3]->`
 - `WHERE` with `=`, `<>`, `>`, `<`, `>=`, `<=`
-- `WHERE` with `=~` (regex), `CONTAINS`, `STARTS WITH`
-- `WHERE` with `AND`, `OR`, `NOT`
+- `WHERE` with `=~` (regex), `CONTAINS`, `STARTS WITH`, `ENDS WITH`
+- `WHERE` with `IN` and list literals: `WHERE f.name IN ['main', 'init']`
+- `WHERE` with `NOT`: `WHERE NOT f.is_exported`
+- `WHERE` with nested `AND`/`OR` (AND binds tighter than OR)
+- `WHERE` with arithmetic expressions: `m.end_line - m.start_line > 80`
+- `WHERE` with property-to-property comparisons: `f.start_line < f.end_line`
 - `RETURN` with property access: `f.name`, `r.confidence`
 - `RETURN` with `COUNT(x)`, `DISTINCT`
 - `ORDER BY` with `ASC`/`DESC`
