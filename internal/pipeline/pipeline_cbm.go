@@ -22,17 +22,18 @@ type cachedExtraction struct {
 // cbmParseFile reads a file, calls cbm.ExtractFile(), and converts the
 // result to the same parseResult format used by the batch write infrastructure.
 // This replaces parseFileAST() — all AST walking happens in C.
-func cbmParseFile(projectName string, f discover.FileInfo) *parseResult {
+func cbmParseFile(projectName string, f discover.FileInfo, tsConfig *tsconfigPathMap) *parseResult {
 	source, cleanup, err := mmapFile(f.Path)
 	if cleanup != nil {
 		defer cleanup()
 	}
-	return cbmParseFileFromSource(projectName, f, source, err)
+	return cbmParseFileFromSource(projectName, f, source, err, tsConfig)
 }
 
 // cbmParseFileFromSource is like cbmParseFile but takes pre-read source data.
 // Used by the producer-consumer pipeline where I/O and CPU are separated.
-func cbmParseFileFromSource(projectName string, f discover.FileInfo, source []byte, readErr error) *parseResult {
+// tsConfig may be nil if no tsconfig.json path aliases are available.
+func cbmParseFileFromSource(projectName string, f discover.FileInfo, source []byte, readErr error, tsConfig *tsconfigPathMap) *parseResult {
 	result := &parseResult{File: f}
 
 	if readErr != nil {
@@ -63,7 +64,6 @@ func cbmParseFileFromSource(projectName string, f discover.FileInfo, source []by
 		FilePath:      f.RelPath,
 		Properties:    make(map[string]any),
 	}
-	result.Nodes = append(result.Nodes, moduleNode)
 
 	// Convert CBM definitions to store.Node objects
 	for i := range cbmResult.Definitions {
@@ -72,15 +72,38 @@ func cbmParseFileFromSource(projectName string, f discover.FileInfo, source []by
 		result.PendingEdges = append(result.PendingEdges, edge)
 	}
 
+	// Append module node AFTER definitions so it wins any QN collision in graph buffer upsert
+	result.Nodes = append(result.Nodes, moduleNode)
+
 	// Enrich module node with properties from CBM result
 	enrichModuleNodeCBM(moduleNode, cbmResult, result)
 
 	// Build import map from CBM imports
 	if len(cbmResult.Imports) > 0 {
 		importMap := make(map[string]string, len(cbmResult.Imports))
+		dir := filepath.Dir(f.RelPath)
 		for _, imp := range cbmResult.Imports {
 			if imp.LocalName != "" && imp.ModulePath != "" {
-				importMap[imp.LocalName] = imp.ModulePath
+				modulePath := imp.ModulePath
+				// Resolve relative imports to module QNs
+				if strings.HasPrefix(modulePath, "./") || strings.HasPrefix(modulePath, "../") {
+					resolved := filepath.Join(dir, modulePath)
+					resolved = filepath.Clean(resolved)
+					resolved = filepath.ToSlash(resolved)
+					// Strip known extensions
+					for _, ext := range []string{".ts", ".tsx", ".js", ".jsx"} {
+						resolved = strings.TrimSuffix(resolved, ext)
+					}
+					// Strip /index suffix (ModuleQN handles index files)
+					resolved = strings.TrimSuffix(resolved, "/index")
+					modulePath = fqn.ModuleQN(projectName, resolved)
+				} else if tsConfig != nil {
+					// Non-relative import: try tsconfig path aliases
+					if resolved := tsConfig.resolvePathAlias(modulePath); resolved != "" {
+						modulePath = fqn.ModuleQN(projectName, resolved)
+					}
+				}
+				importMap[imp.LocalName] = modulePath
 			}
 		}
 		result.ImportMap = importMap

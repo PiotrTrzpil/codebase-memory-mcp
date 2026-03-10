@@ -202,7 +202,7 @@ func validatePushability(scan *ScanNodes, expand *ExpandRelationship, filter *Fi
 				return false
 			}
 			switch c.Operator {
-			case "=", "CONTAINS", "STARTS WITH":
+			case "=", "CONTAINS", "STARTS WITH", "ENDS WITH":
 				// OK
 			default:
 				return false
@@ -365,6 +365,9 @@ func appendFilterConditions(sb *strings.Builder, args *[]any, filter *FilterWher
 		case "STARTS WITH":
 			fmt.Fprintf(sb, " AND %s.%s LIKE ?", alias, col)
 			*args = append(*args, c.Value+"%")
+		case "ENDS WITH":
+			fmt.Fprintf(sb, " AND %s.%s LIKE ?", alias, col)
+			*args = append(*args, "%"+c.Value)
 		}
 	}
 }
@@ -392,11 +395,14 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 				}
 			}
 
-			// Check if the next step is a FilterWhere that can be pushed down
+			// Check if the next step is a FilterWhere that can be pushed down.
+			// Only push down simple AND filters (no mixed AND/OR via Root).
 			var pushDown *FilterWhere
 			if i+1 < len(steps) {
 				if fw, ok := steps[i+1].(*FilterWhere); ok {
-					pushDown = fw
+					if fw.Root == nil || (fw.Root.Operator == "AND" && len(fw.Root.Groups) == 0) {
+						pushDown = fw
+					}
 				}
 			}
 			bindings, err = e.execScan(project, s, pushDown)
@@ -405,10 +411,12 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 		case *fusedExpandMarker:
 			continue // already handled by JOIN fusion
 		case *FilterWhere:
-			// Skip if this was already consumed by push-down
+			// Skip if this was already consumed by push-down (simple AND only)
 			if i > 0 {
 				if _, wasScan := steps[i-1].(*ScanNodes); wasScan {
-					continue // already handled in execScan
+					if s.Root == nil || (s.Root.Operator == "AND" && len(s.Root.Groups) == 0) {
+						continue // already handled in execScan
+					}
 				}
 			}
 			bindings, err = e.execFilter(s, bindings)
@@ -575,6 +583,11 @@ func (e *Executor) execScan(project string, s *ScanNodes, pushDown *FilterWhere)
 	var unpushedConditions []Condition
 	if pushDown != nil {
 		for _, c := range pushDown.Conditions {
+			// Can't push negated or expression-based conditions to SQL
+			if c.Negated || (c.LHS != nil && c.Variable == "") {
+				unpushedConditions = append(unpushedConditions, c)
+				continue
+			}
 			col, canPush := sqlPushableColumns[c.Property]
 			if !canPush {
 				unpushedConditions = append(unpushedConditions, c)
@@ -590,6 +603,9 @@ func (e *Executor) execScan(project string, s *ScanNodes, pushDown *FilterWhere)
 			case "STARTS WITH":
 				query += " AND " + col + " LIKE ?"
 				args = append(args, c.Value+"%")
+			case "ENDS WITH":
+				query += " AND " + col + " LIKE ?"
+				args = append(args, "%"+c.Value)
 			default:
 				// =~, numeric comparisons: can't push to SQL easily
 				unpushedConditions = append(unpushedConditions, c)
@@ -878,7 +894,13 @@ func edgeTargetID(edge *store.Edge, nodeID int64, direction string) int64 {
 func (e *Executor) execFilter(s *FilterWhere, bindings []binding) ([]binding, error) {
 	var result []binding
 	for _, b := range bindings {
-		match, err := e.evaluateConditions(b, s.Conditions, s.Operator)
+		var match bool
+		var err error
+		if s.Root != nil {
+			match, err = e.evaluateGroup(b, s.Root)
+		} else {
+			match, err = e.evaluateConditions(b, s.Conditions, s.Operator)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -887,6 +909,54 @@ func (e *Executor) execFilter(s *FilterWhere, bindings []binding) ([]binding, er
 		}
 	}
 	return result, nil
+}
+
+// evaluateGroup recursively evaluates a ConditionGroup against a binding.
+func (e *Executor) evaluateGroup(b binding, g *ConditionGroup) (bool, error) {
+	if g.Operator == "OR" {
+		// Evaluate sub-groups joined by OR
+		for i := range g.Groups {
+			ok, err := e.evaluateGroup(b, &g.Groups[i])
+			if err != nil {
+				return false, err
+			}
+			if ok {
+				return true, nil
+			}
+		}
+		// Evaluate direct conditions under this OR group
+		for _, c := range g.Conditions {
+			ok, err := e.evaluateCondition(b, c)
+			if err != nil {
+				return false, err
+			}
+			if ok {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+
+	// AND (default)
+	for i := range g.Groups {
+		ok, err := e.evaluateGroup(b, &g.Groups[i])
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	for _, c := range g.Conditions {
+		ok, err := e.evaluateCondition(b, c)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (e *Executor) evaluateConditions(b binding, conditions []Condition, op string) (bool, error) {
@@ -932,8 +1002,156 @@ func (e *Executor) compiledRegex(pattern string) (*regexp.Regexp, error) {
 	return re, nil
 }
 
+// evalExpr evaluates an expression against a binding, returning the resulting value.
+func (e *Executor) evalExpr(b binding, expr Expr) (any, error) {
+	switch ex := expr.(type) {
+	case *LiteralExpr:
+		// Try to parse as number first
+		if f, err := strconv.ParseFloat(ex.Value, 64); err == nil {
+			return f, nil
+		}
+		return ex.Value, nil
+	case *PropertyExpr:
+		if node, ok := b.nodes[ex.Variable]; ok {
+			return getNodeProperty(node, ex.Property), nil
+		}
+		if edge, ok := b.edges[ex.Variable]; ok {
+			return getEdgeProperty(edge, ex.Property), nil
+		}
+		return nil, nil
+	case *ListExpr:
+		// Return the ListExpr itself — handled specially by IN operator
+		return ex, nil
+	case *ArithExpr:
+		leftVal, err := e.evalExpr(b, ex.Left)
+		if err != nil {
+			return nil, err
+		}
+		rightVal, err := e.evalExpr(b, ex.Right)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := toFloat(leftVal)
+		rf, rok := toFloat(rightVal)
+		if !lok || !rok {
+			return nil, fmt.Errorf("arithmetic on non-numeric values: %v %s %v", leftVal, ex.Op, rightVal)
+		}
+		switch ex.Op {
+		case "+":
+			return lf + rf, nil
+		case "-":
+			return lf - rf, nil
+		case "*":
+			return lf * rf, nil
+		default:
+			return nil, fmt.Errorf("unsupported arithmetic operator: %s", ex.Op)
+		}
+	default:
+		return nil, fmt.Errorf("unknown expression type: %T", expr)
+	}
+}
+
 func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
-	// Try node first, then edge
+	// Expression-based evaluation path (new: supports arithmetic, property-to-property)
+	if c.LHS != nil && c.RHS != nil {
+		lhsVal, err := e.evalExpr(b, c.LHS)
+		if err != nil {
+			return false, err
+		}
+		rhsVal, err := e.evalExpr(b, c.RHS)
+		if err != nil {
+			return false, err
+		}
+
+		var result bool
+		switch c.Operator {
+		case "=":
+			result = fmt.Sprintf("%v", lhsVal) == fmt.Sprintf("%v", rhsVal)
+		case "=~":
+			s, ok := lhsVal.(string)
+			if !ok {
+				result = false
+			} else {
+				rs, ok := rhsVal.(string)
+				if !ok {
+					result = false
+				} else {
+					re, err := e.compiledRegex(rs)
+					if err != nil {
+						return false, fmt.Errorf("regex %q: %w", rs, err)
+					}
+					result = re.MatchString(s)
+				}
+			}
+		case "CONTAINS":
+			s, ok := lhsVal.(string)
+			rs, rok := rhsVal.(string)
+			if !ok || !rok {
+				result = false
+			} else {
+				result = strings.Contains(s, rs)
+			}
+		case "STARTS WITH":
+			s, ok := lhsVal.(string)
+			rs, rok := rhsVal.(string)
+			if !ok || !rok {
+				result = false
+			} else {
+				result = strings.HasPrefix(s, rs)
+			}
+		case "ENDS WITH":
+			s, ok := lhsVal.(string)
+			rs, rok := rhsVal.(string)
+			if !ok || !rok {
+				result = false
+			} else {
+				result = strings.HasSuffix(s, rs)
+			}
+		case "IN":
+			listExpr, ok := c.RHS.(*ListExpr)
+			if !ok {
+				result = false
+			} else {
+				lhsStr := fmt.Sprintf("%v", lhsVal)
+				for _, valExpr := range listExpr.Values {
+					val, err := e.evalExpr(b, valExpr)
+					if err != nil {
+						return false, err
+					}
+					if fmt.Sprintf("%v", val) == lhsStr {
+						result = true
+						break
+					}
+				}
+			}
+		case ">", "<", ">=", "<=":
+			lf, lok := toFloat(lhsVal)
+			rf, rok := toFloat(rhsVal)
+			if !lok || !rok {
+				result = false
+			} else {
+				switch c.Operator {
+				case ">":
+					result = lf > rf
+				case "<":
+					result = lf < rf
+				case ">=":
+					result = lf >= rf
+				case "<=":
+					result = lf <= rf
+				}
+			}
+		default:
+			return false, fmt.Errorf("unsupported operator: %s", c.Operator)
+		}
+
+		if c.Negated {
+			result = !result
+		}
+		return result, nil
+	}
+
+	// Legacy path: simple variable.property op value
 	var actual any
 	if node, ok := b.nodes[c.Variable]; ok {
 		actual = getNodeProperty(node, c.Property)
@@ -943,36 +1161,73 @@ func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
 		return false, nil
 	}
 
+	var result bool
 	switch c.Operator {
 	case "=":
-		return fmt.Sprintf("%v", actual) == c.Value, nil
+		result = fmt.Sprintf("%v", actual) == c.Value
 	case "=~":
 		s, ok := actual.(string)
 		if !ok {
-			return false, nil
+			result = false
+		} else {
+			re, err := e.compiledRegex(c.Value)
+			if err != nil {
+				return false, fmt.Errorf("regex %q: %w", c.Value, err)
+			}
+			result = re.MatchString(s)
 		}
-		re, err := e.compiledRegex(c.Value)
-		if err != nil {
-			return false, fmt.Errorf("regex %q: %w", c.Value, err)
-		}
-		return re.MatchString(s), nil
 	case "CONTAINS":
 		s, ok := actual.(string)
 		if !ok {
-			return false, nil
+			result = false
+		} else {
+			result = strings.Contains(s, c.Value)
 		}
-		return strings.Contains(s, c.Value), nil
 	case "STARTS WITH":
 		s, ok := actual.(string)
 		if !ok {
-			return false, nil
+			result = false
+		} else {
+			result = strings.HasPrefix(s, c.Value)
 		}
-		return strings.HasPrefix(s, c.Value), nil
+	case "ENDS WITH":
+		s, ok := actual.(string)
+		if !ok {
+			result = false
+		} else {
+			result = strings.HasSuffix(s, c.Value)
+		}
+	case "IN":
+		listExpr, ok := c.RHS.(*ListExpr)
+		if !ok {
+			result = false
+		} else {
+			actualStr := fmt.Sprintf("%v", actual)
+			for _, valExpr := range listExpr.Values {
+				val, err := e.evalExpr(b, valExpr)
+				if err != nil {
+					return false, err
+				}
+				if fmt.Sprintf("%v", val) == actualStr {
+					result = true
+					break
+				}
+			}
+		}
 	case ">", "<", ">=", "<=":
-		return compareNumeric(actual, c.Value, c.Operator)
+		r, err := compareNumeric(actual, c.Value, c.Operator)
+		if err != nil {
+			return false, err
+		}
+		result = r
 	default:
 		return false, fmt.Errorf("unsupported operator: %s", c.Operator)
 	}
+
+	if c.Negated {
+		result = !result
+	}
+	return result, nil
 }
 
 func compareNumeric(actual any, expected, op string) (bool, error) {

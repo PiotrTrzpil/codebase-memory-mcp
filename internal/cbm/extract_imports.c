@@ -199,6 +199,13 @@ static void parse_python_imports(CBMExtractCtx* ctx) {
 // --- ES module imports (JS/TS/TSX) ---
 // import X from "Y"; import {A, B} from "Y"; import * as X from "Y"
 // const X = require("Y")
+//
+// NOTE: TS `import type { Foo } from "Y"` is also handled here. In the
+// tree-sitter TypeScript grammar, `import type` statements parse as
+// `import_statement` nodes with the same child structure (import_clause,
+// named_imports, import_specifier, source). The `type` keyword is just an
+// additional child node that we skip over, so type imports are extracted
+// identically to value imports and produce IMPORTS edges in the graph.
 
 static void walk_es_imports(CBMExtractCtx* ctx, TSNode node) {
     CBMArena* a = ctx->arena;

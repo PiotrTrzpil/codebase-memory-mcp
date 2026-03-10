@@ -1,6 +1,7 @@
 package cypher
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
@@ -968,6 +969,153 @@ func TestEdgePropertyFilterRegex(t *testing.T) {
 	}
 }
 
+// --- NOT, Arithmetic, Property Comparison tests ---
+
+func TestParseNot(t *testing.T) {
+	q, err := Parse(`MATCH (f:Function) WHERE NOT f.name STARTS WITH "Log" RETURN f.name`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if q.Where == nil {
+		t.Fatal("expected WHERE clause")
+	}
+	c := q.Where.Conditions[0]
+	if !c.Negated {
+		t.Error("expected condition to be negated")
+	}
+	if c.Operator != "STARTS WITH" {
+		t.Errorf("expected 'STARTS WITH', got %q", c.Operator)
+	}
+	if c.Variable != "f" || c.Property != "name" {
+		t.Errorf("expected f.name, got %s.%s", c.Variable, c.Property)
+	}
+}
+
+func TestExecuteNot(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (f:Function) WHERE NOT f.name STARTS WITH "Log" RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// Functions: HandleOrder, ValidateOrder, SubmitOrder, LogError
+	// NOT STARTS WITH "Log" -> 3 results
+	if len(result.Rows) != 3 {
+		t.Errorf("expected 3 rows, got %d", len(result.Rows))
+	}
+	for _, row := range result.Rows {
+		name, _ := row["f.name"].(string)
+		if name == "LogError" {
+			t.Error("LogError should be excluded by NOT STARTS WITH 'Log'")
+		}
+	}
+}
+
+func TestParseArithmetic(t *testing.T) {
+	q, err := Parse(`MATCH (m:Function) WHERE m.end_line - m.start_line > 80 RETURN m.name`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if q.Where == nil {
+		t.Fatal("expected WHERE clause")
+	}
+	c := q.Where.Conditions[0]
+	if c.Operator != ">" {
+		t.Errorf("expected '>', got %q", c.Operator)
+	}
+	// LHS should be an ArithExpr
+	arith, ok := c.LHS.(*ArithExpr)
+	if !ok {
+		t.Fatalf("expected ArithExpr for LHS, got %T", c.LHS)
+	}
+	if arith.Op != "-" {
+		t.Errorf("expected '-', got %q", arith.Op)
+	}
+	lProp, ok := arith.Left.(*PropertyExpr)
+	if !ok {
+		t.Fatalf("expected PropertyExpr for left, got %T", arith.Left)
+	}
+	if lProp.Variable != "m" || lProp.Property != "end_line" {
+		t.Errorf("expected m.end_line, got %s.%s", lProp.Variable, lProp.Property)
+	}
+	rProp, ok := arith.Right.(*PropertyExpr)
+	if !ok {
+		t.Fatalf("expected PropertyExpr for right, got %T", arith.Right)
+	}
+	if rProp.Variable != "m" || rProp.Property != "start_line" {
+		t.Errorf("expected m.start_line, got %s.%s", rProp.Variable, rProp.Property)
+	}
+	// RHS should be a LiteralExpr "80"
+	lit, ok := c.RHS.(*LiteralExpr)
+	if !ok {
+		t.Fatalf("expected LiteralExpr for RHS, got %T", c.RHS)
+	}
+	if lit.Value != "80" {
+		t.Errorf("expected '80', got %q", lit.Value)
+	}
+}
+
+func TestExecuteArithmetic(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// Functions with end_line - start_line > 20:
+	// HandleOrder: 30-10=20 (not > 20)
+	// SubmitOrder: 50-25=25 (> 20)
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.end_line - f.start_line > 20 RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["f.name"] != "SubmitOrder" {
+		t.Errorf("expected SubmitOrder, got %v", result.Rows[0]["f.name"])
+	}
+}
+
+func TestExecutePropertyComparison(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// f.start_line < f.end_line should be true for all functions with valid lines
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.start_line < f.end_line RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// All 4 functions have start_line < end_line
+	if len(result.Rows) != 4 {
+		t.Errorf("expected 4 rows (all functions), got %d", len(result.Rows))
+	}
+}
+
+func TestParseErrorMessage(t *testing.T) {
+	// Verify error messages are readable
+	_, err := Parse(`MATCH (f:Function) WHERE f.name`)
+	if err == nil {
+		t.Fatal("expected parse error")
+	}
+	errMsg := err.Error()
+	// Should contain human-readable token names, not just numbers
+	if !strings.Contains(errMsg, "expected") {
+		t.Errorf("error message should contain 'expected', got: %s", errMsg)
+	}
+
+	// Test expect() error message
+	_, err = Parse(`MATCH f:Function) RETURN f`)
+	if err == nil {
+		t.Fatal("expected parse error")
+	}
+	errMsg = err.Error()
+	if !strings.Contains(errMsg, "'('") || !strings.Contains(errMsg, "identifier") {
+		t.Errorf("error message should mention '(' and identifier, got: %s", errMsg)
+	}
+}
+
 func TestEdgeBuiltinPropertyFilter(t *testing.T) {
 	s := setupTestStoreMultiEdge(t)
 	defer s.Close()
@@ -980,5 +1128,179 @@ func TestEdgeBuiltinPropertyFilter(t *testing.T) {
 	}
 	if len(result.Rows) != 2 {
 		t.Fatalf("expected 2 rows (both HTTP_CALLS edges), got %d", len(result.Rows))
+	}
+}
+
+// --- ENDS WITH tests ---
+
+func TestParseEndsWith(t *testing.T) {
+	q, err := Parse(`MATCH (f:Function) WHERE f.name ENDS WITH "Order" RETURN f.name`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if q.Where == nil {
+		t.Fatal("expected WHERE clause")
+	}
+	c := q.Where.Conditions[0]
+	if c.Operator != "ENDS WITH" {
+		t.Errorf("expected 'ENDS WITH', got %q", c.Operator)
+	}
+	if c.Value != "Order" {
+		t.Errorf("expected 'Order', got %q", c.Value)
+	}
+	if c.Variable != "f" || c.Property != "name" {
+		t.Errorf("expected f.name, got %s.%s", c.Variable, c.Property)
+	}
+}
+
+func TestExecuteEndsWith(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.name ENDS WITH "Order" RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// HandleOrder, ValidateOrder, SubmitOrder all end with "Order"
+	if len(result.Rows) != 3 {
+		t.Errorf("expected 3 rows, got %d", len(result.Rows))
+	}
+	for _, row := range result.Rows {
+		name, _ := row["f.name"].(string)
+		if !strings.HasSuffix(name, "Order") {
+			t.Errorf("expected name ending with 'Order', got %q", name)
+		}
+	}
+}
+
+// --- IN operator tests ---
+
+func TestParseIn(t *testing.T) {
+	q, err := Parse(`MATCH (f:Function) WHERE f.name IN ["HandleOrder", "LogError"] RETURN f.name`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if q.Where == nil {
+		t.Fatal("expected WHERE clause")
+	}
+	c := q.Where.Conditions[0]
+	if c.Operator != "IN" {
+		t.Errorf("expected 'IN', got %q", c.Operator)
+	}
+	if c.Variable != "f" || c.Property != "name" {
+		t.Errorf("expected f.name, got %s.%s", c.Variable, c.Property)
+	}
+	listExpr, ok := c.RHS.(*ListExpr)
+	if !ok {
+		t.Fatalf("expected *ListExpr as RHS, got %T", c.RHS)
+	}
+	if len(listExpr.Values) != 2 {
+		t.Fatalf("expected 2 values in list, got %d", len(listExpr.Values))
+	}
+}
+
+func TestExecuteIn(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.name IN ["HandleOrder", "LogError"] RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(result.Rows))
+	}
+	names := map[string]bool{}
+	for _, row := range result.Rows {
+		names[row["f.name"].(string)] = true
+	}
+	if !names["HandleOrder"] {
+		t.Error("expected HandleOrder in results")
+	}
+	if !names["LogError"] {
+		t.Error("expected LogError in results")
+	}
+}
+
+// --- Mixed AND/OR tests ---
+
+func TestParseMixedAndOr(t *testing.T) {
+	q, err := Parse(`MATCH (f) WHERE f.label = "Function" AND f.name = "Foo" OR f.name = "Bar" RETURN f`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if q.Where == nil {
+		t.Fatal("expected WHERE clause")
+	}
+	if q.Where.Root == nil {
+		t.Fatal("expected Root ConditionGroup")
+	}
+	root := q.Where.Root
+	// Root should be OR with 2 sub-groups
+	if root.Operator != "OR" {
+		t.Errorf("expected root operator 'OR', got %q", root.Operator)
+	}
+	if len(root.Groups) != 2 {
+		t.Fatalf("expected 2 groups under OR, got %d", len(root.Groups))
+	}
+	// First group: AND with 2 conditions
+	g1 := root.Groups[0]
+	if g1.Operator != "AND" {
+		t.Errorf("expected first group operator 'AND', got %q", g1.Operator)
+	}
+	if len(g1.Conditions) != 2 {
+		t.Errorf("expected 2 conditions in first AND group, got %d", len(g1.Conditions))
+	}
+	// Second group: AND with 1 condition (f.name = "Bar")
+	g2 := root.Groups[1]
+	if len(g2.Conditions) != 1 {
+		t.Errorf("expected 1 condition in second group, got %d", len(g2.Conditions))
+	}
+	if g2.Conditions[0].Value != "Bar" {
+		t.Errorf("expected 'Bar', got %q", g2.Conditions[0].Value)
+	}
+}
+
+func TestExecuteMixedAndOr(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// (f.label = "Function" AND f.name = "HandleOrder") OR (f.name = "LogError")
+	// Should match HandleOrder and LogError
+	result, err := exec.Execute(`MATCH (f) WHERE f.label = "Function" AND f.name = "HandleOrder" OR f.name = "LogError" RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %v", len(result.Rows), result.Rows)
+	}
+	names := map[string]bool{}
+	for _, row := range result.Rows {
+		names[row["f.name"].(string)] = true
+	}
+	if !names["HandleOrder"] {
+		t.Error("expected HandleOrder in results")
+	}
+	if !names["LogError"] {
+		t.Error("expected LogError in results")
+	}
+}
+
+func TestExecuteMixedAndOrPrecedence(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// AND binds tighter: (label="Module" AND name="main") OR (name="LogError")
+	// Should match: Module "main" and Function "LogError" = 2 results
+	result, err := exec.Execute(`MATCH (f) WHERE f.label = "Module" AND f.name = "main" OR f.name = "LogError" RETURN f.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %v", len(result.Rows), result.Rows)
 	}
 }

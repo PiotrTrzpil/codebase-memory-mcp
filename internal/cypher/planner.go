@@ -41,6 +41,7 @@ func (*ExpandRelationship) stepType() string { return "expand" }
 type FilterWhere struct {
 	Conditions []Condition
 	Operator   string // "AND" or "OR"
+	Root       *ConditionGroup
 }
 
 func (*FilterWhere) stepType() string { return "filter" }
@@ -86,7 +87,7 @@ func BuildPlan(q *Query) (*Plan, error) {
 	// Optimization: push WHERE conditions that reference only the first
 	// scan variable BEFORE any expand steps. This dramatically reduces the
 	// number of bindings that need to be expanded.
-	earlyFilters, lateFilters := splitWhereFilters(q.Where, firstNode.Variable, len(elements) > 1)
+	earlyFilters, lateWhere := splitWhereFilters(q.Where, firstNode.Variable, len(elements) > 1)
 
 	// Insert early filter right after scan
 	if len(earlyFilters) > 0 {
@@ -125,38 +126,118 @@ func BuildPlan(q *Query) (*Plan, error) {
 	}
 
 	// Late WHERE filter (conditions referencing expand variables)
-	if len(lateFilters) > 0 {
+	if lateWhere != nil {
 		plan.Steps = append(plan.Steps, &FilterWhere{
-			Conditions: lateFilters,
-			Operator:   q.Where.Operator,
+			Conditions: lateWhere.Conditions,
+			Operator:   lateWhere.Operator,
+			Root:       lateWhere.Root,
 		})
 	} else if q.Where != nil && len(earlyFilters) == 0 {
 		// No split happened — add all conditions at the end
 		plan.Steps = append(plan.Steps, &FilterWhere{
 			Conditions: q.Where.Conditions,
 			Operator:   q.Where.Operator,
+			Root:       q.Where.Root,
 		})
 	}
 
 	return plan, nil
 }
 
+// exprVariables collects all variable names referenced in an expression.
+func exprVariables(e Expr) []string {
+	if e == nil {
+		return nil
+	}
+	switch ex := e.(type) {
+	case *PropertyExpr:
+		return []string{ex.Variable}
+	case *LiteralExpr:
+		return nil
+	case *ArithExpr:
+		return append(exprVariables(ex.Left), exprVariables(ex.Right)...)
+	case *ListExpr:
+		var vars []string
+		for _, v := range ex.Values {
+			vars = append(vars, exprVariables(v)...)
+		}
+		return vars
+	default:
+		return nil
+	}
+}
+
+// conditionVariables returns all variables referenced by a condition.
+func conditionVariables(c Condition) []string {
+	if c.LHS != nil {
+		vars := exprVariables(c.LHS)
+		vars = append(vars, exprVariables(c.RHS)...)
+		return vars
+	}
+	return []string{c.Variable}
+}
+
 // splitWhereFilters separates WHERE conditions into early (scan-only) and late filters.
-func splitWhereFilters(where *WhereClause, scanVar string, hasExpand bool) (early, late []Condition) {
+// Returns the early conditions as a flat slice and the remaining WHERE clause (or nil).
+func splitWhereFilters(where *WhereClause, scanVar string, hasExpand bool) (early []Condition, lateWhere *WhereClause) {
 	if where == nil {
 		return nil, nil
 	}
 
-	if hasExpand && where.Operator == "AND" {
-		for _, c := range where.Conditions {
-			if c.Variable == scanVar {
+	// When the root group is AND at the top level, we can extract scan-only conditions.
+	if hasExpand && where.Root != nil && where.Root.Operator == "AND" && len(where.Root.Groups) == 0 {
+		// Simple AND group with only conditions — same as old behavior
+		var late []Condition
+		for _, c := range where.Root.Conditions {
+			vars := conditionVariables(c)
+			allScan := true
+			for _, v := range vars {
+				if v != scanVar {
+					allScan = false
+					break
+				}
+			}
+			if allScan {
 				early = append(early, c)
 			} else {
 				late = append(late, c)
 			}
 		}
-		return early, late
+		if len(late) > 0 {
+			return early, &WhereClause{
+				Conditions: late,
+				Operator:   "AND",
+				Root:       &ConditionGroup{Conditions: late, Operator: "AND"},
+			}
+		}
+		return early, nil
 	}
-	// Can't split OR conditions or when there's no expand
-	return nil, where.Conditions
+
+	// For mixed AND/OR or legacy: can't split, return everything as late
+	if hasExpand && where.Operator == "AND" && where.Root == nil {
+		// Legacy path (no Root)
+		var late []Condition
+		for _, c := range where.Conditions {
+			vars := conditionVariables(c)
+			allScan := true
+			for _, v := range vars {
+				if v != scanVar {
+					allScan = false
+					break
+				}
+			}
+			if allScan {
+				early = append(early, c)
+			} else {
+				late = append(late, c)
+			}
+		}
+		if len(late) > 0 {
+			return early, &WhereClause{Conditions: late, Operator: "AND"}
+		}
+		return early, nil
+	}
+
+	// Can't split OR or mixed conditions
+	return nil, where
 }

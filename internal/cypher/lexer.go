@@ -28,6 +28,8 @@ const (
 	TokNot                       // NOT
 	TokAsc                       // ASC
 	TokDesc                      // DESC
+	TokEnds                      // ENDS
+	TokIn                        // IN
 
 	// Symbols
 	TokLParen   // (
@@ -48,6 +50,7 @@ const (
 	TokGTE      // >=
 	TokLTE      // <=
 	TokPipe     // |
+	TokPlus     // +
 	TokDotDot   // ..
 
 	// Literals
@@ -57,6 +60,35 @@ const (
 
 	TokEOF // end of input
 )
+
+// tokenNames maps token types to human-readable names for error messages.
+var tokenNames = map[TokenType]string{
+	TokMatch: "MATCH", TokWhere: "WHERE", TokReturn: "RETURN",
+	TokOrder: "ORDER", TokBy: "BY", TokLimit: "LIMIT",
+	TokAnd: "AND", TokOr: "OR", TokAs: "AS",
+	TokDistinct: "DISTINCT", TokCount: "COUNT",
+	TokContains: "CONTAINS", TokStarts: "STARTS", TokWith: "WITH",
+	TokNot: "NOT", TokAsc: "ASC", TokDesc: "DESC",
+	TokEnds: "ENDS", TokIn: "IN",
+	TokLParen: "'('", TokRParen: "')'",
+	TokLBracket: "'['", TokRBracket: "']'",
+	TokDash: "'-'", TokGT: "'>'", TokLT: "'<'",
+	TokColon: "':'", TokDot: "'.'",
+	TokLBrace: "'{'", TokRBrace: "'}'",
+	TokStar: "'*'", TokComma: "','",
+	TokEQ: "'='", TokRegex: "'=~'",
+	TokGTE: "'>='", TokLTE: "'<='",
+	TokPipe: "'|'", TokPlus: "'+'", TokDotDot: "'..'",
+	TokIdent: "identifier", TokString: "string", TokNumber: "number",
+	TokEOF: "end of input",
+}
+
+func (t TokenType) String() string {
+	if name, ok := tokenNames[t]; ok {
+		return name
+	}
+	return fmt.Sprintf("token(%d)", int(t))
+}
 
 // Token is a single lexer token.
 type Token struct {
@@ -88,6 +120,8 @@ var keywords = map[string]TokenType{
 	"NOT":      TokNot,
 	"ASC":      TokAsc,
 	"DESC":     TokDesc,
+	"ENDS":     TokEnds,
+	"IN":       TokIn,
 }
 
 // singleCharTokens maps single-character symbols to their token type.
@@ -101,6 +135,7 @@ var singleCharTokens = map[byte]TokenType{
 	'*': TokStar,
 	',': TokComma,
 	'|': TokPipe,
+	'+': TokPlus,
 	':': TokColon,
 	'-': TokDash,
 }

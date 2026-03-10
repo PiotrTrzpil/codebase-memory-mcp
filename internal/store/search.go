@@ -375,6 +375,21 @@ func (s *Store) scanDegrees(query string, args []any, result map[int64]degreePai
 	return rows.Err()
 }
 
+// moduleEdgeTypes are edge types that exist on Module nodes, not File nodes.
+// When searching for File nodes with these relationship types, we fall back to
+// the corresponding Module node's degree.
+var moduleEdgeTypes = map[string]bool{
+	"IMPORTS":    true,
+	"CALLS":     true,
+	"USES_TYPE":  true,
+	"USAGE":     true,
+	"THROWS":    true,
+	"RAISES":    true,
+	"READS":     true,
+	"WRITES":    true,
+	"CONFIGURES": true,
+}
+
 // buildFilteredResults applies degree, direction, and entry-point filters to nodes,
 // counts degrees, and loads connected names for each qualifying result.
 func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*SearchResult, error) {
@@ -389,6 +404,14 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 		return nil, err
 	}
 
+	// When searching File nodes with a Module-level edge type, look up Module
+	// node degrees as a fallback for File nodes that have degree 0.
+	if params.Label == "File" && params.Relationship != "" && moduleEdgeTypes[params.Relationship] {
+		if err := s.enrichFileDegreesFromModules(nodes, degrees, params); err != nil {
+			return nil, err
+		}
+	}
+
 	results := make([]*SearchResult, 0, len(nodes))
 	for _, n := range nodes {
 		dp := degrees[n.ID]
@@ -398,9 +421,14 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 			OutDegree: dp.OutDegree,
 		}
 
-		degree := sr.InDegree
-		if params.Direction == "outbound" {
+		var degree int
+		switch params.Direction {
+		case "outbound":
 			degree = sr.OutDegree
+		case "inbound":
+			degree = sr.InDegree
+		default:
+			degree = sr.InDegree + sr.OutDegree
 		}
 		if params.MinDegree >= 0 && degree < params.MinDegree {
 			continue
@@ -419,6 +447,96 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 		results = append(results, sr)
 	}
 	return results, nil
+}
+
+// enrichFileDegreesFromModules finds Module nodes that share the same file_path
+// as File nodes with zero degree, and uses the Module's degree instead.
+func (s *Store) enrichFileDegreesFromModules(nodes []*Node, degrees map[int64]degreePair, params *SearchParams) error {
+	// Collect File nodes that have zero degree for the requested relationship
+	type fileInfo struct {
+		nodeID   int64
+		filePath string
+	}
+	var zeroFiles []fileInfo
+	for _, n := range nodes {
+		if n.Label != "File" {
+			continue
+		}
+		dp := degrees[n.ID]
+		if dp.InDegree+dp.OutDegree > 0 {
+			continue
+		}
+		zeroFiles = append(zeroFiles, fileInfo{nodeID: n.ID, filePath: n.FilePath})
+	}
+	if len(zeroFiles) == 0 {
+		return nil
+	}
+
+	// Look up Module node IDs for each file_path
+	const maxPerQuery = 998
+	moduleIDs := make(map[string]int64, len(zeroFiles)) // filePath -> module node ID
+	for i := 0; i < len(zeroFiles); i += maxPerQuery {
+		end := i + maxPerQuery
+		if end > len(zeroFiles) {
+			end = len(zeroFiles)
+		}
+		chunk := zeroFiles[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, params.Project)
+		for j, f := range chunk {
+			placeholders[j] = "?"
+			args = append(args, f.filePath)
+		}
+		query := fmt.Sprintf(
+			"SELECT id, file_path FROM nodes WHERE project = ? AND label = 'Module' AND file_path IN (%s)",
+			strings.Join(placeholders, ","),
+		)
+		rows, err := s.q.Query(query, args...)
+		if err != nil {
+			return fmt.Errorf("lookup module nodes: %w", err)
+		}
+		for rows.Next() {
+			var id int64
+			var fp string
+			if err := rows.Scan(&id, &fp); err != nil {
+				rows.Close()
+				return err
+			}
+			moduleIDs[fp] = id
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+
+	if len(moduleIDs) == 0 {
+		return nil
+	}
+
+	// Batch count degrees for the Module nodes
+	modIDList := make([]int64, 0, len(moduleIDs))
+	for _, id := range moduleIDs {
+		modIDList = append(modIDList, id)
+	}
+	modDegrees, err := s.batchCountDegrees(modIDList, params.Relationship)
+	if err != nil {
+		return fmt.Errorf("module degree count: %w", err)
+	}
+
+	// Copy Module degrees back to the File node entries
+	for _, f := range zeroFiles {
+		modID, ok := moduleIDs[f.filePath]
+		if !ok {
+			continue
+		}
+		if mdp, ok := modDegrees[modID]; ok {
+			degrees[f.nodeID] = mdp
+		}
+	}
+	return nil
 }
 
 // extractLikeHints extracts literal substrings from a regex pattern for SQL LIKE pre-filtering.

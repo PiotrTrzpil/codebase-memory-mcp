@@ -37,7 +37,7 @@ func (p *Parser) advance() Token {
 func (p *Parser) expect(typ TokenType) error {
 	t := p.advance()
 	if t.Type != typ {
-		return fmt.Errorf("expected token %d, got %d (%q) at pos %d", typ, t.Type, t.Value, t.Pos)
+		return fmt.Errorf("expected %s, got %s %q at position %d", typ, t.Type, t.Value, t.Pos)
 	}
 	return nil
 }
@@ -348,48 +348,98 @@ func (p *Parser) parseInlineProps() (map[string]string, error) {
 
 func (p *Parser) parseWhere() (*WhereClause, error) {
 	p.advance() // consume WHERE
-	w := &WhereClause{Operator: "AND"}
 
-	cond, err := p.parseCondition()
+	root, err := p.parseOrExpr()
 	if err != nil {
 		return nil, err
 	}
-	w.Conditions = append(w.Conditions, cond)
 
-	for p.peek().Type == TokAnd || p.peek().Type == TokOr {
-		op := p.advance()
-		if op.Type == TokOr {
-			w.Operator = "OR"
-		}
-		cond, err := p.parseCondition()
-		if err != nil {
-			return nil, err
-		}
-		w.Conditions = append(w.Conditions, cond)
-	}
+	w := &WhereClause{Root: &root}
+
+	// Populate legacy flat fields for backward compatibility.
+	// If root is a single AND or OR group with only conditions (no sub-groups),
+	// flatten into the legacy Conditions/Operator fields.
+	w.Conditions = flattenConditions(&root)
+	w.Operator = root.Operator
 
 	return w, nil
+}
+
+// parseOrExpr parses OR-separated AND-groups (OR has lower precedence).
+func (p *Parser) parseOrExpr() (ConditionGroup, error) {
+	first, err := p.parseAndExpr()
+	if err != nil {
+		return ConditionGroup{}, err
+	}
+
+	// If no OR follows, return the AND group directly
+	if p.peek().Type != TokOr {
+		return first, nil
+	}
+
+	// Collect AND-groups joined by OR
+	orGroup := ConditionGroup{Operator: "OR"}
+	orGroup.Groups = append(orGroup.Groups, first)
+
+	for p.peek().Type == TokOr {
+		p.advance() // consume OR
+		next, err := p.parseAndExpr()
+		if err != nil {
+			return ConditionGroup{}, err
+		}
+		orGroup.Groups = append(orGroup.Groups, next)
+	}
+
+	return orGroup, nil
+}
+
+// parseAndExpr parses AND-separated conditions (AND has higher precedence).
+func (p *Parser) parseAndExpr() (ConditionGroup, error) {
+	cond, err := p.parseCondition()
+	if err != nil {
+		return ConditionGroup{}, err
+	}
+
+	group := ConditionGroup{Operator: "AND"}
+	group.Conditions = append(group.Conditions, cond)
+
+	for p.peek().Type == TokAnd {
+		p.advance() // consume AND
+		cond, err := p.parseCondition()
+		if err != nil {
+			return ConditionGroup{}, err
+		}
+		group.Conditions = append(group.Conditions, cond)
+	}
+
+	return group, nil
+}
+
+// flattenConditions returns all conditions from a group tree as a flat slice.
+func flattenConditions(g *ConditionGroup) []Condition {
+	var result []Condition
+	result = append(result, g.Conditions...)
+	for i := range g.Groups {
+		result = append(result, flattenConditions(&g.Groups[i])...)
+	}
+	return result
 }
 
 func (p *Parser) parseCondition() (Condition, error) {
 	c := Condition{}
 
-	// variable.property
-	varTok := p.advance()
-	if varTok.Type != TokIdent {
-		return c, fmt.Errorf("expected variable name in condition, got %q at pos %d", varTok.Value, varTok.Pos)
-	}
-	c.Variable = varTok.Value
-
-	if err := p.expect(TokDot); err != nil {
-		return c, fmt.Errorf("expected '.' after variable in condition: %w", err)
+	// Optional NOT prefix
+	if p.peek().Type == TokNot {
+		p.advance()
+		c.Negated = true
 	}
 
-	propTok := p.advance()
-	if propTok.Type != TokIdent {
-		return c, fmt.Errorf("expected property name in condition, got %q at pos %d", propTok.Value, propTok.Pos)
+	// Parse LHS expression
+	lhs, err := p.parseExpr()
+	if err != nil {
+		return c, fmt.Errorf("condition LHS: %w", err)
 	}
-	c.Property = propTok.Value
+	c.LHS = lhs
 
 	// Operator
 	op := p.peek()
@@ -423,22 +473,135 @@ func (p *Parser) parseCondition() (Condition, error) {
 		}
 		p.advance() // consume WITH
 		c.Operator = "STARTS WITH"
+	case TokEnds:
+		// ENDS WITH
+		p.advance() // consume ENDS
+		if p.peek().Type != TokWith {
+			return c, fmt.Errorf("expected WITH after ENDS at pos %d", p.peek().Pos)
+		}
+		p.advance() // consume WITH
+		c.Operator = "ENDS WITH"
+	case TokIn:
+		// IN [list]
+		p.advance() // consume IN
+		c.Operator = "IN"
+
+		// Parse the list expression as RHS
+		listExpr, listErr := p.parseListLiteral()
+		if listErr != nil {
+			return c, fmt.Errorf("IN list: %w", listErr)
+		}
+		c.RHS = listExpr
+
+		// Flatten to legacy fields when possible: simple PropertyExpr LHS
+		if prop, ok := lhs.(*PropertyExpr); ok {
+			c.Variable = prop.Variable
+			c.Property = prop.Property
+		}
+
+		return c, nil
 	default:
 		return c, fmt.Errorf("expected comparison operator, got %q at pos %d", op.Value, op.Pos)
 	}
 
-	// Value (string or number)
-	valTok := p.advance()
-	switch valTok.Type {
-	case TokString:
-		c.Value = valTok.Value
-	case TokNumber:
-		c.Value = valTok.Value
-	default:
-		return c, fmt.Errorf("expected value in condition, got %q at pos %d", valTok.Value, valTok.Pos)
+	// Parse RHS expression
+	rhs, err := p.parseExpr()
+	if err != nil {
+		return c, fmt.Errorf("condition RHS: %w", err)
+	}
+	c.RHS = rhs
+
+	// Flatten to legacy fields when possible: simple PropertyExpr LHS + LiteralExpr RHS
+	if prop, ok := lhs.(*PropertyExpr); ok {
+		c.Variable = prop.Variable
+		c.Property = prop.Property
+	}
+	if lit, ok := rhs.(*LiteralExpr); ok {
+		c.Value = lit.Value
 	}
 
 	return c, nil
+}
+
+// parsePrimaryExpr parses a primary expression: number, string, list literal, or variable.property.
+func (p *Parser) parsePrimaryExpr() (Expr, error) {
+	tok := p.peek()
+	switch tok.Type {
+	case TokNumber:
+		p.advance()
+		return &LiteralExpr{Value: tok.Value}, nil
+	case TokString:
+		p.advance()
+		return &LiteralExpr{Value: tok.Value}, nil
+	case TokLBracket:
+		return p.parseListLiteral()
+	case TokIdent:
+		p.advance()
+		if p.peek().Type == TokDot {
+			p.advance() // consume '.'
+			propTok := p.advance()
+			if propTok.Type != TokIdent {
+				return nil, fmt.Errorf("expected property name after '.', got %s %q at position %d", propTok.Type, propTok.Value, propTok.Pos)
+			}
+			return &PropertyExpr{Variable: tok.Value, Property: propTok.Value}, nil
+		}
+		return nil, fmt.Errorf("expected '.' after variable %q at position %d", tok.Value, tok.Pos)
+	default:
+		return nil, fmt.Errorf("expected string, number, or variable.property in expression, got %s %q at position %d", tok.Type, tok.Value, tok.Pos)
+	}
+}
+
+// parseListLiteral parses [expr, expr, ...] into a ListExpr.
+func (p *Parser) parseListLiteral() (*ListExpr, error) {
+	if err := p.expect(TokLBracket); err != nil {
+		return nil, fmt.Errorf("expected '[' for list: %w", err)
+	}
+
+	list := &ListExpr{}
+	if p.peek().Type == TokRBracket {
+		p.advance() // empty list
+		return list, nil
+	}
+
+	first, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	list.Values = append(list.Values, first)
+
+	for p.peek().Type == TokComma {
+		p.advance() // consume comma
+		val, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		list.Values = append(list.Values, val)
+	}
+
+	if err := p.expect(TokRBracket); err != nil {
+		return nil, fmt.Errorf("expected ']' to close list: %w", err)
+	}
+
+	return list, nil
+}
+
+// parseExpr parses an expression with optional arithmetic operators (+, -, *).
+func (p *Parser) parseExpr() (Expr, error) {
+	left, err := p.parsePrimaryExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	for p.peek().Type == TokPlus || p.peek().Type == TokDash || p.peek().Type == TokStar {
+		opTok := p.advance()
+		right, err := p.parsePrimaryExpr()
+		if err != nil {
+			return nil, err
+		}
+		left = &ArithExpr{Left: left, Op: opTok.Value, Right: right}
+	}
+
+	return left, nil
 }
 
 func (p *Parser) parseReturn() (*ReturnClause, error) {

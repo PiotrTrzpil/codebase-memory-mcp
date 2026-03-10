@@ -44,6 +44,8 @@ type Pipeline struct {
 	importMaps map[string]map[string]string
 	// returnTypes maps function QN -> return type QN for return-type-based type inference
 	returnTypes ReturnTypeMap
+	// tsConfig holds parsed tsconfig.json path aliases for TS/JS import resolution
+	tsConfig *tsconfigPathMap
 }
 
 // New creates a new Pipeline.
@@ -244,6 +246,9 @@ func (p *Pipeline) runFullPasses(files []discover.FileInfo) error {
 	// All node/edge writes go to RAM; flushed to SQLite after pass 14.
 	p.buf = newGraphBuffer(p.ProjectName)
 
+	// Load tsconfig.json path aliases for TS/JS import resolution
+	p.tsConfig = loadTSConfig(p.RepoPath)
+
 	t := time.Now()
 	if err := p.passStructure(files); err != nil {
 		return fmt.Errorf("pass1 structure: %w", err)
@@ -400,6 +405,9 @@ func (p *Pipeline) runIncrementalPasses(
 	allFiles []discover.FileInfo,
 	changed, unchanged []discover.FileInfo,
 ) error {
+	// Load tsconfig.json path aliases for TS/JS import resolution
+	p.tsConfig = loadTSConfig(p.RepoPath)
+
 	// Pass 1: Structure always runs on all files (fast, idempotent upserts)
 	if err := p.passStructure(allFiles); err != nil {
 		return fmt.Errorf("pass1 structure: %w", err)
@@ -955,7 +963,7 @@ func (p *Pipeline) passDefinitions(files []discover.FileInfo) {
 			if p.ctx.Err() != nil {
 				return
 			}
-			results[i] = cbmParseFile(p.ProjectName, f)
+			results[i] = cbmParseFile(p.ProjectName, f, p.tsConfig)
 			pf.advance(i + 1)
 		}()
 	}
@@ -1293,6 +1301,90 @@ func (p *Pipeline) passImports() {
 		}
 	}
 	slog.Info("pass2b.imports.done", "edges", count)
+
+	// Barrel/re-export resolution: for each module that imports a barrel (index) module,
+	// also create transitive IMPORTS edges to the barrel's own imports.
+	barrelCount := p.resolveBarrelImports()
+	if barrelCount > 0 {
+		slog.Info("pass2b.barrel_imports", "edges", barrelCount)
+	}
+}
+
+// isBarrelModule returns true if the module's file_path indicates it is a barrel/index file.
+func isBarrelModule(node *store.Node) bool {
+	if node == nil || node.FilePath == "" {
+		return false
+	}
+	base := filepath.Base(node.FilePath)
+	for _, name := range []string{"index.ts", "index.tsx", "index.js", "index.jsx"} {
+		if base == name {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveBarrelImports creates transitive IMPORTS edges through barrel (index) modules.
+// For each module M that imports a barrel module B, and B imports submodule S,
+// create an IMPORTS edge M→S with via_barrel property.
+func (p *Pipeline) resolveBarrelImports() int {
+	count := 0
+
+	// Collect barrel modules: modules whose file is an index file
+	barrelQNs := make(map[string]bool)
+	for moduleQN := range p.importMaps {
+		node, _ := p.findNodeByQN(p.ProjectName, moduleQN)
+		if isBarrelModule(node) {
+			barrelQNs[moduleQN] = true
+		}
+	}
+
+	if len(barrelQNs) == 0 {
+		return 0
+	}
+
+	// For each module, check if any of its imports point to a barrel
+	for moduleQN, importMap := range p.importMaps {
+		if barrelQNs[moduleQN] {
+			// Don't resolve barrel's own re-exports transitively
+			continue
+		}
+		moduleNode, _ := p.findNodeByQN(p.ProjectName, moduleQN)
+		if moduleNode == nil {
+			continue
+		}
+		for _, targetQN := range importMap {
+			if !barrelQNs[targetQN] {
+				continue
+			}
+			// targetQN is a barrel module; get the barrel's own imports
+			barrelImports, ok := p.importMaps[targetQN]
+			if !ok {
+				continue
+			}
+			for _, subTargetQN := range barrelImports {
+				if subTargetQN == moduleQN {
+					continue // skip self-references
+				}
+				subNode, _ := p.findNodeByQN(p.ProjectName, subTargetQN)
+				if subNode == nil {
+					continue
+				}
+				_ = p.insertEdge(&store.Edge{
+					Project:  p.ProjectName,
+					SourceID: moduleNode.ID,
+					TargetID: subNode.ID,
+					Type:     "IMPORTS",
+					Properties: map[string]any{
+						"via_barrel": targetQN,
+					},
+				})
+				count++
+			}
+		}
+	}
+
+	return count
 }
 
 // passHTTPLinks runs the HTTP linker to discover cross-service HTTP calls.

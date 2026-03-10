@@ -43,8 +43,18 @@ type RelPattern struct {
 func (*RelPattern) patternElement() {}
 
 // WhereClause holds filter conditions joined by AND/OR.
+// When Root is non-nil, it is used instead of the flat Conditions/Operator fields.
 type WhereClause struct {
+	Conditions []Condition // legacy flat list (used when Root is nil)
+	Operator   string      // "AND" or "OR" (used when Root is nil)
+	Root       *ConditionGroup
+}
+
+// ConditionGroup represents a group of conditions joined by a single operator.
+// Groups can be nested to support mixed AND/OR: (a AND b) OR c
+type ConditionGroup struct {
 	Conditions []Condition
+	Groups     []ConditionGroup
 	Operator   string // "AND" or "OR"
 }
 
@@ -54,7 +64,42 @@ type Condition struct {
 	Property string // "name"
 	Operator string // "=", "=~", "CONTAINS", "STARTS WITH", ">", "<", ">=", "<="
 	Value    string // the comparison value
+	Negated  bool   // true when prefixed with NOT
+	LHS      Expr   // expression-based left-hand side (nil for legacy simple conditions)
+	RHS      Expr   // expression-based right-hand side (nil for legacy simple conditions)
 }
+
+// Expr represents an expression in a WHERE condition (property access, literal, or arithmetic).
+type Expr interface{ exprNode() }
+
+// PropertyExpr is a variable.property access (e.g. f.start_line).
+type PropertyExpr struct {
+	Variable string
+	Property string
+}
+
+func (*PropertyExpr) exprNode() {}
+
+// LiteralExpr is a string or numeric literal.
+type LiteralExpr struct{ Value string }
+
+func (*LiteralExpr) exprNode() {}
+
+// ArithExpr is a binary arithmetic expression (e.g. m.end_line - m.start_line).
+type ArithExpr struct {
+	Left  Expr
+	Op    string // "+", "-", "*"
+	Right Expr
+}
+
+func (*ArithExpr) exprNode() {}
+
+// ListExpr is a list literal [expr, expr, ...] used with the IN operator.
+type ListExpr struct {
+	Values []Expr
+}
+
+func (*ListExpr) exprNode() {}
 
 // ReturnClause specifies which data to return from the query.
 type ReturnClause struct {

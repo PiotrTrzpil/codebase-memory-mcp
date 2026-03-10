@@ -27,7 +27,15 @@ func (s *Server) handleQueryGraph(_ context.Context, req *mcp.CallToolRequest) (
 	exec := &cypher.Executor{Store: st}
 	result, err := exec.Execute(query)
 	if err != nil {
-		return errResult(fmt.Sprintf("query error: %v", err)), nil
+		return errResult(fmt.Sprintf("query error: %v\n\nSupported Cypher subset:\n"+
+			"  MATCH (var:Label)-[:TYPE]->(var2) WHERE ... RETURN ...\n"+
+			"  Operators: =, =~, >, <, >=, <=, CONTAINS, STARTS WITH, NOT\n"+
+			"  Arithmetic: var.prop - var.prop > value\n"+
+			"  Property comparison: a.prop < b.prop\n"+
+			"  Aggregation: COUNT(var), DISTINCT\n"+
+			"  Modifiers: ORDER BY field ASC|DESC, LIMIT n\n"+
+			"  Variable-length: -[:TYPE*1..3]->\n"+
+			"  Multi-type: -[:CALLS|HTTP_CALLS]->", err)), nil
 	}
 
 	responseData := map[string]any{

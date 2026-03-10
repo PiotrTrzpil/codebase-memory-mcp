@@ -1126,12 +1126,30 @@ static void extract_class_methods(CBMExtractCtx* ctx, TSNode class_node,
             continue;
         }
 
-        if (!cbm_kind_in_set(child, spec->function_node_types)) continue;
+        if (cbm_kind_in_set(child, spec->function_node_types)) {
+            TSNode name_node = resolve_method_name(child, ctx->language);
+            if (!ts_node_is_null(name_node)) {
+                push_method_def(ctx, child, class_qn, spec, name_node);
+            }
+            continue;
+        }
 
-        TSNode name_node = resolve_method_name(child, ctx->language);
-        if (ts_node_is_null(name_node)) continue;
-
-        push_method_def(ctx, child, class_qn, spec, name_node);
+        // Handle arrow functions inside field definitions (TS/JS class fields):
+        //   class Foo { myMethod = () => { ... } }
+        // The class body child is public_field_definition/field_definition,
+        // with the arrow_function nested inside.
+        const char* child_kind = ts_node_type(child);
+        if (strcmp(child_kind, "public_field_definition") == 0 ||
+            strcmp(child_kind, "field_definition") == 0) {
+            // Look for arrow_function or function_expression in the field value
+            TSNode value = ts_node_child_by_field_name(child, "value", 5);
+            if (!ts_node_is_null(value) && cbm_kind_in_set(value, spec->function_node_types)) {
+                TSNode name_node = resolve_method_name(value, ctx->language);
+                if (!ts_node_is_null(name_node)) {
+                    push_method_def(ctx, value, class_qn, spec, name_node);
+                }
+            }
+        }
     }
 }
 

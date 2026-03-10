@@ -824,11 +824,16 @@ func getBoolArg(args map[string]any, key string) bool {
 	if !ok {
 		return false
 	}
-	b, ok := v.(bool)
-	if !ok {
+	switch b := v.(type) {
+	case bool:
+		return b
+	case string:
+		return b == "true" || b == "1" || b == "yes"
+	case float64:
+		return b != 0
+	default:
 		return false
 	}
-	return b
 }
 
 // findNodeAcrossProjects searches for a node by simple name in the specified project.
