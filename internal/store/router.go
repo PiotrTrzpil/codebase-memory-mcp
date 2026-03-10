@@ -73,6 +73,14 @@ func (r *StoreRouter) ForProject(name string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open store %q: %w", name, err)
 	}
+
+	// Clean up stale project entries with different casing. On case-insensitive
+	// filesystems (macOS/Windows), different casings of the same path open the
+	// same .db file, creating duplicate project entries within it.
+	if cleaned, cleanErr := s.CleanStaleProjects(name); cleanErr == nil && cleaned > 0 {
+		slog.Info("router.clean_stale", "project", name, "removed", cleaned)
+	}
+
 	r.stores[name] = s
 	return s, nil
 }

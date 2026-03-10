@@ -219,6 +219,85 @@ func TestProjectCRUD(t *testing.T) {
 	}
 }
 
+func TestCleanStaleProjects(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+
+	// Simulate case-insensitive FS: 3 project entries for the same repo
+	for _, name := range []string{
+		"Users-foo-Code-MyApp",
+		"Users-foo-Code-myapp",
+		"users-foo-code-myapp",
+	} {
+		if err := s.UpsertProject(name, "/Users/foo/Code/myapp"); err != nil {
+			t.Fatalf("UpsertProject(%q): %v", name, err)
+		}
+		// Add a node so we can verify cascade delete
+		s.UpsertNode(&Node{
+			Project: name, Label: "Function", Name: "main",
+			QualifiedName: name + ".main",
+		})
+	}
+
+	// Verify 3 projects exist
+	projects, _ := s.ListProjects()
+	if len(projects) != 3 {
+		t.Fatalf("expected 3 projects, got %d", len(projects))
+	}
+
+	// Clean: keep only the canonical lowercase name
+	cleaned, err := s.CleanStaleProjects("users-foo-code-myapp")
+	if err != nil {
+		t.Fatalf("CleanStaleProjects: %v", err)
+	}
+	if cleaned != 2 {
+		t.Errorf("expected 2 cleaned, got %d", cleaned)
+	}
+
+	// Verify only 1 project remains
+	projects, _ = s.ListProjects()
+	if len(projects) != 1 {
+		t.Fatalf("expected 1 project after cleanup, got %d", len(projects))
+	}
+	if projects[0].Name != "users-foo-code-myapp" {
+		t.Errorf("expected 'users-foo-code-myapp', got %q", projects[0].Name)
+	}
+
+	// Verify cascade: only the canonical project's nodes remain
+	nodes, _ := s.AllNodes("users-foo-code-myapp")
+	if len(nodes) != 1 {
+		t.Errorf("expected 1 node for canonical project, got %d", len(nodes))
+	}
+	staleNodes, _ := s.AllNodes("Users-foo-Code-MyApp")
+	if len(staleNodes) != 0 {
+		t.Errorf("expected 0 nodes for stale project, got %d", len(staleNodes))
+	}
+}
+
+func TestCleanStaleProjectsNoop(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("myproject", "/tmp/myproject"); err != nil {
+		t.Fatal(err)
+	}
+
+	// No stale projects → should be a no-op
+	cleaned, err := s.CleanStaleProjects("myproject")
+	if err != nil {
+		t.Fatalf("CleanStaleProjects: %v", err)
+	}
+	if cleaned != 0 {
+		t.Errorf("expected 0 cleaned, got %d", cleaned)
+	}
+}
+
 func TestFileHashes(t *testing.T) {
 	s, err := OpenMemory()
 	if err != nil {

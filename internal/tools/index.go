@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/discover"
@@ -53,6 +54,14 @@ func (s *Server) handleIndexRepository(ctx context.Context, req *mcp.CallToolReq
 	st, err := s.router.ForProject(projectName)
 	if err != nil {
 		return errResult(fmt.Sprintf("store: %v", err)), nil
+	}
+
+	// Clean up stale project entries from previous indexing runs that used
+	// different casing (e.g. "Users-foo-Bar" vs "users-foo-bar"). On
+	// case-insensitive filesystems (macOS/Windows) these map to the same
+	// .db file but create duplicate data within it.
+	if cleaned, err := st.CleanStaleProjects(projectName); err == nil && cleaned > 0 {
+		slog.Info("index.clean_stale", "project", projectName, "removed", cleaned)
 	}
 
 	// Run the indexing pipeline

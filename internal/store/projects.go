@@ -56,6 +56,28 @@ func (s *Store) DeleteProject(name string) error {
 	return err
 }
 
+// CleanStaleProjects removes project entries whose name matches canonicalName
+// case-insensitively but isn't the exact canonical string. This cleans up
+// duplicates caused by case-insensitive filesystems (macOS/Windows) where the
+// same repo was indexed under different path casings.
+func (s *Store) CleanStaleProjects(canonicalName string) (int, error) {
+	projects, err := s.ListProjects()
+	if err != nil {
+		return 0, err
+	}
+	cleaned := 0
+	lower := strings.ToLower(canonicalName)
+	for _, p := range projects {
+		if strings.ToLower(p.Name) == lower && p.Name != canonicalName {
+			if err := s.DeleteProject(p.Name); err != nil {
+				return cleaned, fmt.Errorf("clean stale project %q: %w", p.Name, err)
+			}
+			cleaned++
+		}
+	}
+	return cleaned, nil
+}
+
 // FileHash represents a stored file content hash for incremental reindex.
 type FileHash struct {
 	Project string

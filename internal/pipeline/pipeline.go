@@ -84,7 +84,9 @@ func ProjectNameFromPath(absPath string) string {
 	if name == "" {
 		return "root"
 	}
-	return name
+	// Normalize to lowercase so the same repo always gets the same project name
+	// regardless of OS-reported path casing (macOS/Windows are case-insensitive).
+	return strings.ToLower(name)
 }
 
 // checkCancel returns ctx.Err() if the pipeline's context has been cancelled.
