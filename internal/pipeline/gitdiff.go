@@ -19,6 +19,7 @@ const (
 	DiffStaged   DiffScope = "staged"
 	DiffAll      DiffScope = "all"
 	DiffBranch   DiffScope = "branch"
+	DiffCommits  DiffScope = "commits"
 )
 
 // ChangedFile represents a file with a status from git diff --name-status.
@@ -36,20 +37,22 @@ type ChangedHunk struct {
 }
 
 // ParseGitDiffFiles runs git diff --name-status and returns changed files.
-func ParseGitDiffFiles(repoPath string, scope DiffScope, baseBranch string) ([]ChangedFile, error) {
-	args := buildDiffArgs(scope, baseBranch)
+// toRef is only used when scope is DiffCommits; pass "" for all other scopes.
+func ParseGitDiffFiles(repoPath string, scope DiffScope, baseBranch, toRef string) ([]ChangedFile, error) {
+	args := buildDiffArgs(scope, baseBranch, toRef)
 	args = append(args, "--name-status")
 	return parseDiffNameStatus(repoPath, args)
 }
 
 // ParseGitDiffHunks runs git diff --unified=0 and extracts changed line ranges.
-func ParseGitDiffHunks(repoPath string, scope DiffScope, baseBranch string) ([]ChangedHunk, error) {
-	args := buildDiffArgs(scope, baseBranch)
+// toRef is only used when scope is DiffCommits; pass "" for all other scopes.
+func ParseGitDiffHunks(repoPath string, scope DiffScope, baseBranch, toRef string) ([]ChangedHunk, error) {
+	args := buildDiffArgs(scope, baseBranch, toRef)
 	args = append(args, "--unified=0")
 	return parseDiffHunks(repoPath, args)
 }
 
-func buildDiffArgs(scope DiffScope, baseBranch string) []string {
+func buildDiffArgs(scope DiffScope, baseBranch, toRef string) []string {
 	base := []string{"diff"}
 	switch scope {
 	case DiffStaged:
@@ -61,6 +64,15 @@ func buildDiffArgs(scope DiffScope, baseBranch string) []string {
 			baseBranch = "main"
 		}
 		return append(base, baseBranch+"...HEAD")
+	case DiffCommits:
+		fromRef := baseBranch
+		if fromRef == "" {
+			fromRef = "HEAD~1"
+		}
+		if toRef == "" {
+			toRef = "HEAD"
+		}
+		return append(base, fromRef+"..."+toRef)
 	default: // unstaged
 		return base
 	}

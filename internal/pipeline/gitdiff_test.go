@@ -180,3 +180,148 @@ func TestParseHunksOutput_Deletion(t *testing.T) {
 		t.Errorf("start = %d, want 10", hunks[0].StartLine)
 	}
 }
+
+// TestBuildDiffArgs_Commits verifies that DiffCommits produces the correct git diff range.
+func TestBuildDiffArgs_Commits(t *testing.T) {
+	tests := []struct {
+		name       string
+		baseBranch string
+		toRef      string
+		wantArgs   []string
+	}{
+		{
+			name:       "explicit refs",
+			baseBranch: "v1.2.0",
+			toRef:      "v1.3.0",
+			wantArgs:   []string{"diff", "v1.2.0...v1.3.0"},
+		},
+		{
+			name:       "empty toRef defaults to HEAD",
+			baseBranch: "v1.0.0",
+			toRef:      "",
+			wantArgs:   []string{"diff", "v1.0.0...HEAD"},
+		},
+		{
+			name:       "empty baseBranch defaults to HEAD~1",
+			baseBranch: "",
+			toRef:      "v2.0.0",
+			wantArgs:   []string{"diff", "HEAD~1...v2.0.0"},
+		},
+		{
+			name:       "both empty defaults to HEAD~1...HEAD",
+			baseBranch: "",
+			toRef:      "",
+			wantArgs:   []string{"diff", "HEAD~1...HEAD"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildDiffArgs(DiffCommits, tt.baseBranch, tt.toRef)
+			if len(got) != len(tt.wantArgs) {
+				t.Fatalf("buildDiffArgs args = %v, want %v", got, tt.wantArgs)
+			}
+			for i, want := range tt.wantArgs {
+				if got[i] != want {
+					t.Errorf("arg[%d] = %q, want %q", i, got[i], want)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildDiffArgs_ExistingScopesUnchanged verifies backward compat — existing scopes
+// produce the same args regardless of toRef.
+func TestBuildDiffArgs_ExistingScopesUnchanged(t *testing.T) {
+	tests := []struct {
+		scope    DiffScope
+		base     string
+		wantArgs []string
+	}{
+		{DiffUnstaged, "", []string{"diff"}},
+		{DiffStaged, "", []string{"diff", "--cached"}},
+		{DiffAll, "", []string{"diff", "HEAD"}},
+		{DiffBranch, "main", []string{"diff", "main...HEAD"}},
+		{DiffBranch, "", []string{"diff", "main...HEAD"}}, // defaults to "main"
+	}
+
+	for _, tt := range tests {
+		got := buildDiffArgs(tt.scope, tt.base, "")
+		if len(got) != len(tt.wantArgs) {
+			t.Errorf("scope %q: got %v, want %v", tt.scope, got, tt.wantArgs)
+			continue
+		}
+		for i, want := range tt.wantArgs {
+			if got[i] != want {
+				t.Errorf("scope %q arg[%d] = %q, want %q", tt.scope, i, got[i], want)
+			}
+		}
+	}
+}
+
+// TestParseGitDiffFiles_CommitRange verifies ParseGitDiffFiles with DiffCommits scope
+// using a real two-commit test repository.
+func TestParseGitDiffFiles_CommitRange(t *testing.T) {
+	// First commit: initial file.
+	repoPath := initTestRepo(t, map[string]string{
+		"main.go": "package main\n\nfunc Hello() string { return \"v1\" }\n",
+	})
+
+	// Second commit: modify main.go, add new.go.
+	commitFiles(t, repoPath, map[string]string{
+		"main.go": "package main\n\nfunc Hello() string { return \"v2\" }\n",
+		"new.go":  "package main\n\nfunc New() {}\n",
+	})
+
+	// Diff between HEAD~1 (first commit) and HEAD (second commit).
+	files, err := ParseGitDiffFiles(repoPath, DiffCommits, "HEAD~1", "HEAD")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(files) < 1 {
+		t.Fatalf("expected at least 1 changed file, got %d", len(files))
+	}
+
+	// Build a map for easy lookup.
+	byPath := make(map[string]ChangedFile)
+	for _, f := range files {
+		byPath[f.Path] = f
+	}
+
+	if f, ok := byPath["main.go"]; !ok {
+		t.Error("expected main.go to be listed as changed")
+	} else if f.Status != "M" {
+		t.Errorf("main.go status = %q, want M", f.Status)
+	}
+
+	if f, ok := byPath["new.go"]; !ok {
+		t.Error("expected new.go to be listed as added")
+	} else if f.Status != "A" {
+		t.Errorf("new.go status = %q, want A", f.Status)
+	}
+}
+
+// TestParseGitDiffFiles_CommitRange_DefaultRefs verifies that empty refs default correctly.
+func TestParseGitDiffFiles_CommitRange_DefaultRefs(t *testing.T) {
+	repoPath := initTestRepo(t, map[string]string{
+		"a.go": "package main\n",
+	})
+
+	commitFiles(t, repoPath, map[string]string{
+		"a.go": "package main\n\n// updated\n",
+	})
+
+	// Empty baseBranch → HEAD~1, empty toRef → HEAD.
+	files, err := ParseGitDiffFiles(repoPath, DiffCommits, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(files) != 1 {
+		t.Fatalf("expected 1 changed file, got %d", len(files))
+	}
+	if files[0].Path != "a.go" {
+		t.Errorf("expected a.go, got %q", files[0].Path)
+	}
+}
