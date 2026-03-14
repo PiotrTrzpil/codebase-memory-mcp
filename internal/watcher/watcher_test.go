@@ -32,6 +32,13 @@ func newTestRouter(t *testing.T, projectName, rootPath string) *store.StoreRoute
 	return r
 }
 
+// newTestWatcher creates a watcher with a session project set.
+func newTestWatcher(r *store.StoreRouter, projectName, rootPath string, indexFn IndexFunc) *Watcher {
+	w := New(r, indexFn)
+	w.SetSessionProject(projectName, rootPath)
+	return w
+}
+
 func TestSnapshotsEqual(t *testing.T) {
 	now := time.Now()
 
@@ -176,7 +183,8 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := newTestRouter(t, filepath.Base(tmpDir), tmpDir)
+	projectName := filepath.Base(tmpDir)
+	r := newTestRouter(t, projectName, tmpDir)
 	defer r.CloseAll()
 
 	var indexCount atomic.Int32
@@ -185,10 +193,10 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 		return nil
 	}
 
-	w := New(r, indexFn)
+	w := newTestWatcher(r, projectName, tmpDir, indexFn)
 
 	// First poll — baseline capture, no index
-	w.pollAll()
+	w.pollSession()
 	if indexCount.Load() != 0 {
 		t.Errorf("first poll should not trigger index, got %d", indexCount.Load())
 	}
@@ -198,7 +206,7 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 	for _, state := range w.projects {
 		state.nextPoll = time.Time{}
 	}
-	w.pollAll()
+	w.pollSession()
 	if indexCount.Load() != 0 {
 		t.Errorf("no-change poll should not trigger index, got %d", indexCount.Load())
 	}
@@ -213,7 +221,7 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 	for _, state := range w.projects {
 		state.nextPoll = time.Time{}
 	}
-	w.pollAll()
+	w.pollSession()
 	if indexCount.Load() != 1 {
 		t.Errorf("changed file should trigger index, got %d", indexCount.Load())
 	}
@@ -228,6 +236,7 @@ func TestWatcherCancellation(t *testing.T) {
 	defer r.CloseAll()
 
 	w := New(r, func(_ context.Context, _, _ string) error { return nil })
+	// No session project set — Run should still exit on cancel
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -252,12 +261,12 @@ func TestWatcherSkipsMissingRoot(t *testing.T) {
 	defer r.CloseAll()
 
 	var indexCount atomic.Int32
-	w := New(r, func(_ context.Context, _, _ string) error {
+	w := newTestWatcher(r, "ghost", "/nonexistent/path", func(_ context.Context, _, _ string) error {
 		indexCount.Add(1)
 		return nil
 	})
 
-	w.pollAll()
+	w.pollSession()
 	if indexCount.Load() != 0 {
 		t.Errorf("should not index missing root, got %d", indexCount.Load())
 	}
@@ -270,17 +279,18 @@ func TestWatcherNewFileTriggersIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := newTestRouter(t, filepath.Base(tmpDir), tmpDir)
+	projectName := filepath.Base(tmpDir)
+	r := newTestRouter(t, projectName, tmpDir)
 	defer r.CloseAll()
 
 	var indexCount atomic.Int32
-	w := New(r, func(_ context.Context, _, _ string) error {
+	w := newTestWatcher(r, projectName, tmpDir, func(_ context.Context, _, _ string) error {
 		indexCount.Add(1)
 		return nil
 	})
 
 	// Baseline
-	w.pollAll()
+	w.pollSession()
 
 	// Add a new file
 	if err := os.WriteFile(filepath.Join(tmpDir, "util.go"), []byte("package main\n"), 0o600); err != nil {
@@ -290,7 +300,7 @@ func TestWatcherNewFileTriggersIndex(t *testing.T) {
 	for _, state := range w.projects {
 		state.nextPoll = time.Time{}
 	}
-	w.pollAll()
+	w.pollSession()
 	if indexCount.Load() != 1 {
 		t.Errorf("new file should trigger index, got %d", indexCount.Load())
 	}

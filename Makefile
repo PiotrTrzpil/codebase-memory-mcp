@@ -18,4 +18,8 @@ clean:
 	rm -rf bin/
 
 install:
+	@pkill -f 'codebase-memory-mcp$$' 2>/dev/null && sleep 0.3 || true
 	go install ./cmd/codebase-memory-mcp/
+	@if [ -d "$(HOME)/.local/bin" ] && [ "$$(go env GOPATH)/bin" != "$(HOME)/.local/bin" ]; then \
+		cp "$$(go env GOPATH)/bin/$(BINARY)" "$(HOME)/.local/bin/$(BINARY)"; \
+	fi

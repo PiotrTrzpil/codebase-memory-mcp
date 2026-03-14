@@ -63,44 +63,42 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 	}
 
 	type resultEntry struct {
-		Project        string   `json:"project"`
 		Name           string   `json:"name"`
-		QualifiedName  string   `json:"qualified_name"`
+		QualifiedName  string   `json:"qn"`
 		Label          string   `json:"label"`
-		FilePath       string   `json:"file_path"`
-		StartLine      int      `json:"start_line"`
-		EndLine        int      `json:"end_line"`
-		InDegree       int      `json:"in_degree"`
-		OutDegree      int      `json:"out_degree"`
-		ConnectedNames []string `json:"connected_names,omitempty"`
+		FilePath       string   `json:"file"`
+		Lines          string   `json:"lines"`
+		InDegree       int      `json:"in"`
+		OutDegree      int      `json:"out"`
+		ConnectedNames []string `json:"connected,omitempty"`
 	}
 
 	results := make([]resultEntry, 0, len(output.Results))
 	for _, r := range output.Results {
 		results = append(results, resultEntry{
-			Project:        projName,
 			Name:           r.Node.Name,
-			QualifiedName:  r.Node.QualifiedName,
+			QualifiedName:  stripQNPrefix(r.Node.QualifiedName, projName),
 			Label:          r.Node.Label,
 			FilePath:       r.Node.FilePath,
-			StartLine:      r.Node.StartLine,
-			EndLine:        r.Node.EndLine,
+			Lines:          fmt.Sprintf("%d-%d", r.Node.StartLine, r.Node.EndLine),
 			InDegree:       r.InDegree,
 			OutDegree:      r.OutDegree,
 			ConnectedNames: r.ConnectedNames,
 		})
 	}
 
+	hasMore := params.Offset+params.Limit < output.Total
 	responseData := map[string]any{
-		"total":    output.Total,
-		"limit":    params.Limit,
-		"offset":   params.Offset,
-		"has_more": params.Offset+params.Limit < output.Total,
-		"results":  results,
+		"total":   output.Total,
+		"results": results,
+	}
+	if hasMore {
+		responseData["has_more"] = true
+		responseData["next_offset"] = params.Offset + params.Limit
 	}
 	s.addIndexStatus(responseData)
 
-	result := jsonResult(responseData)
+	result := s.result(responseData)
 	s.addUpdateNotice(result)
 	return result, nil
 }

@@ -186,6 +186,10 @@ func printSummary(toolName, text, dbPath string) {
 		printIndexStatusSummary(data)
 	case "detect_changes":
 		printDetectChangesSummary(data)
+	case "get_architecture":
+		printArchitectureSummary(data)
+	case "manage_adr":
+		printADRSummary(data)
 	default:
 		// Fallback: pretty-print the JSON
 		printRawJSON(text)
@@ -265,12 +269,31 @@ func printSearchGraphSummary(data map[string]any) {
 		if filePath != "" {
 			fmt.Printf("  %s:%d", filePath, startLine)
 		}
+		// Degree counts
+		inDeg := jsonInt(m["in_degree"])
+		outDeg := jsonInt(m["out_degree"])
+		if inDeg > 0 || outDeg > 0 {
+			fmt.Printf("\n         in=%d out=%d", inDeg, outDeg)
+		}
 		fmt.Println()
+		// Connected names (from include_connected=true)
+		if connected, ok := m["connected_names"].([]any); ok && len(connected) > 0 {
+			names := make([]string, 0, len(connected))
+			for _, c := range connected {
+				if s, ok := c.(string); ok {
+					names = append(names, s)
+				}
+			}
+			fmt.Printf("         connected: %s\n", strings.Join(names, ", "))
+		}
 	}
 }
 
 func printSearchCodeSummary(data map[string]any) {
-	total := jsonInt(data["total"])
+	total := jsonInt(data["total_matches"])
+	if total == 0 {
+		total = jsonInt(data["total"]) // backwards compat
+	}
 	hasMore, _ := data["has_more"].(bool)
 	matches, _ := data["matches"].([]any)
 	shown := len(matches)
@@ -287,6 +310,14 @@ func printSearchCodeSummary(data map[string]any) {
 			line := jsonInt(entry["line"])
 			content, _ := entry["content"].(string)
 			fmt.Printf("  %s:%d  %s\n", file, line, content)
+			// Print context lines if present
+			if ctx, ok := entry["context"].([]any); ok && len(ctx) > 0 {
+				for _, c := range ctx {
+					if s, ok := c.(string); ok {
+						fmt.Printf("       %s\n", s)
+					}
+				}
+			}
 		}
 	}
 }
@@ -294,23 +325,111 @@ func printSearchCodeSummary(data map[string]any) {
 func printTraceSummary(data map[string]any) {
 	root, _ := data["root"].(map[string]any)
 	rootName, _ := root["name"].(string)
-	totalResults := jsonInt(data["total_results"])
-	edges, _ := data["edges"].([]any)
 	hops, _ := data["hops"].([]any)
 
-	fmt.Printf("Trace from %q: %d node(s), %d edge(s), %d hop(s)\n", rootName, totalResults, len(edges), len(hops))
+	// Handle summary_only mode
+	isSummary, _ := data["summary_only"].(bool)
+	if isSummary {
+		totalNodes := jsonInt(data["total_nodes"])
+		totalEdges := jsonInt(data["total_edges"])
+		fmt.Printf("Trace from %q: %d node(s), %d edge(s), %d hop(s)  [summary]\n", rootName, totalNodes, totalEdges, len(hops))
+	} else {
+		totalResults := jsonInt(data["total_results"])
+		edges, _ := data["edges"].([]any)
+		fmt.Printf("Trace from %q: %d node(s), %d edge(s), %d hop(s)\n", rootName, totalResults, len(edges), len(hops))
+	}
+
+	// Root node details
+	if root != nil {
+		if label, ok := root["label"].(string); ok {
+			fmt.Printf("  root: [%s] %s", label, rootName)
+			if fp, ok := root["file_path"].(string); ok && fp != "" {
+				fmt.Printf("  %s:%d", fp, jsonInt(root["start_line"]))
+			}
+			fmt.Println()
+		}
+		if sig, ok := root["signature"].(string); ok && sig != "" {
+			fmt.Printf("    sig: %s\n", sig)
+		}
+		if rt, ok := root["return_type"].(string); ok && rt != "" {
+			fmt.Printf("    return_type: %s\n", rt)
+		}
+	}
+
+	// Impact summary (when risk_labels=true)
+	if impact, ok := data["impact_summary"].(map[string]any); ok {
+		critical := jsonInt(impact["critical"])
+		high := jsonInt(impact["high"])
+		medium := jsonInt(impact["medium"])
+		low := jsonInt(impact["low"])
+		impactTotal := jsonInt(impact["total"])
+		fmt.Printf("  impact: %d total — CRITICAL: %d  HIGH: %d  MEDIUM: %d  LOW: %d\n", impactTotal, critical, high, medium, low)
+		if crossSvc, ok := impact["has_cross_service"].(bool); ok && crossSvc {
+			fmt.Printf("  ⚠ has cross-service edges\n")
+		}
+	}
+
+	// Edge type distribution (summary_only mode)
+	if isSummary {
+		if edgeTypes, ok := data["edge_types"].(map[string]any); ok && len(edgeTypes) > 0 {
+			fmt.Printf("  edge types:")
+			for et, count := range edgeTypes {
+				fmt.Printf("  %s: %d", et, jsonInt(count))
+			}
+			fmt.Println()
+		}
+	}
 
 	for _, h := range hops {
 		if hop, ok := h.(map[string]any); ok {
 			hopNum := jsonInt(hop["hop"])
+			// Summary mode: hops have "count" instead of "nodes"
+			if isSummary {
+				count := jsonInt(hop["count"])
+				fmt.Printf("  hop %d: %d node(s)\n", hopNum, count)
+				continue
+			}
 			nodes, _ := hop["nodes"].([]any)
 			fmt.Printf("  hop %d: %d node(s)\n", hopNum, len(nodes))
 			for _, n := range nodes {
 				if nm, ok := n.(map[string]any); ok {
 					name, _ := nm["name"].(string)
 					label, _ := nm["label"].(string)
-					fmt.Printf("    [%s] %s\n", label, name)
+					line := fmt.Sprintf("    [%s] %s", label, name)
+					if risk, ok := nm["risk"].(string); ok && risk != "" {
+						line += fmt.Sprintf("  [%s]", risk)
+					}
+					if sig, ok := nm["signature"].(string); ok && sig != "" {
+						line += fmt.Sprintf("  sig: %s", sig)
+					}
+					fmt.Println(line)
 				}
+			}
+		}
+	}
+
+	edgesArr, _ := data["edges"].([]any)
+	if len(edgesArr) > 0 {
+		fmt.Println("  edges:")
+		for _, e := range edgesArr {
+			if edge, ok := e.(map[string]any); ok {
+				from, _ := edge["from"].(string)
+				to, _ := edge["to"].(string)
+				edgeType, _ := edge["type"].(string)
+				line := fmt.Sprintf("    %s → %s [%s]", from, to, edgeType)
+				if conf, ok := edge["confidence"].(float64); ok && conf > 0 {
+					band, _ := edge["confidence_band"].(string)
+					strategy, _ := edge["resolution_strategy"].(string)
+					line += fmt.Sprintf("  confidence=%.2f", conf)
+					if band != "" {
+						line += fmt.Sprintf(" (%s", band)
+						if strategy != "" {
+							line += fmt.Sprintf(", %s", strategy)
+						}
+						line += ")"
+					}
+				}
+				fmt.Println(line)
 			}
 		}
 	}
@@ -401,7 +520,25 @@ func printSnippetSummary(data map[string]any) {
 	endLine := jsonInt(data["end_line"])
 	source, _ := data["source"].(string)
 
-	fmt.Printf("[%s] %s  (%s:%d-%d)\n\n", label, name, filePath, startLine, endLine)
+	fmt.Printf("[%s] %s  (%s:%d-%d)\n", label, name, filePath, startLine, endLine)
+	if sig, ok := data["signature"].(string); ok && sig != "" {
+		fmt.Printf("  signature: %s\n", sig)
+	}
+	if rt, ok := data["return_type"].(string); ok && rt != "" {
+		fmt.Printf("  return_type: %s\n", rt)
+	}
+	if complexity, ok := data["complexity"]; ok {
+		fmt.Printf("  complexity: %v\n", complexity)
+	}
+	if doc, ok := data["docstring"].(string); ok && doc != "" {
+		fmt.Printf("  docstring: %s\n", doc)
+	}
+	callers := jsonInt(data["callers"])
+	callees := jsonInt(data["callees"])
+	if callers > 0 || callees > 0 {
+		fmt.Printf("  callers=%d callees=%d\n", callers, callees)
+	}
+	fmt.Println()
 	fmt.Println(source)
 }
 
@@ -517,6 +654,181 @@ func printDetectChangesSummary(data map[string]any) {
 		label, _ := m["label"].(string)
 		changedBy, _ := m["changed_by"].(string)
 		fmt.Printf("  [%s] [%s] %s  (via %s)\n", risk, label, name, changedBy)
+	}
+}
+
+func printArchitectureSummary(data map[string]any) {
+	project, _ := data["project"].(string)
+	fmt.Printf("Architecture: %s\n", project)
+
+	if langs, ok := data["languages"].([]any); ok && len(langs) > 0 {
+		fmt.Printf("  languages (%d):\n", len(langs))
+		for _, l := range langs {
+			if lm, ok := l.(map[string]any); ok {
+				lang, _ := lm["language"].(string)
+				count := jsonInt(lm["file_count"])
+				fmt.Printf("    %-20s %d files\n", lang, count)
+			}
+		}
+	}
+
+	if pkgs, ok := data["packages"].([]any); ok && len(pkgs) > 0 {
+		fmt.Printf("  packages (%d):\n", len(pkgs))
+		for _, p := range pkgs {
+			if pm, ok := p.(map[string]any); ok {
+				name, _ := pm["name"].(string)
+				nodes := jsonInt(pm["node_count"])
+				fanIn := jsonInt(pm["fan_in"])
+				fanOut := jsonInt(pm["fan_out"])
+				fmt.Printf("    %-20s %d nodes  fan_in=%d fan_out=%d\n", name, nodes, fanIn, fanOut)
+			}
+		}
+	}
+
+	if eps, ok := data["entry_points"].([]any); ok && len(eps) > 0 {
+		fmt.Printf("  entry_points (%d):\n", len(eps))
+		for _, e := range eps {
+			if em, ok := e.(map[string]any); ok {
+				name, _ := em["name"].(string)
+				file, _ := em["file"].(string)
+				fmt.Printf("    %s  %s\n", name, file)
+			}
+		}
+	}
+
+	if routes, ok := data["routes"].([]any); ok && len(routes) > 0 {
+		fmt.Printf("  routes (%d):\n", len(routes))
+		for _, r := range routes {
+			if rm, ok := r.(map[string]any); ok {
+				method, _ := rm["method"].(string)
+				path, _ := rm["path"].(string)
+				handler, _ := rm["handler"].(string)
+				fmt.Printf("    %-6s %-30s → %s\n", method, path, handler)
+			}
+		}
+	}
+
+	if hotspots, ok := data["hotspots"].([]any); ok && len(hotspots) > 0 {
+		fmt.Printf("  hotspots (%d):\n", len(hotspots))
+		for _, h := range hotspots {
+			if hm, ok := h.(map[string]any); ok {
+				name, _ := hm["name"].(string)
+				fanIn := jsonInt(hm["fan_in"])
+				fmt.Printf("    %-30s fan_in=%d\n", name, fanIn)
+			}
+		}
+	}
+
+	if boundaries, ok := data["boundaries"].([]any); ok && len(boundaries) > 0 {
+		fmt.Printf("  boundaries (%d):\n", len(boundaries))
+		for _, b := range boundaries {
+			if bm, ok := b.(map[string]any); ok {
+				from, _ := bm["from"].(string)
+				to, _ := bm["to"].(string)
+				count := jsonInt(bm["call_count"])
+				fmt.Printf("    %s → %s  %d calls\n", from, to, count)
+			}
+		}
+	}
+
+	if services, ok := data["services"].([]any); ok && len(services) > 0 {
+		fmt.Printf("  services (%d):\n", len(services))
+		for _, s := range services {
+			if sm, ok := s.(map[string]any); ok {
+				from, _ := sm["from"].(string)
+				to, _ := sm["to"].(string)
+				stype, _ := sm["type"].(string)
+				count := jsonInt(sm["count"])
+				fmt.Printf("    %s → %s [%s]  %d\n", from, to, stype, count)
+			}
+		}
+	}
+
+	if layers, ok := data["layers"].([]any); ok && len(layers) > 0 {
+		fmt.Printf("  layers (%d):\n", len(layers))
+		for _, l := range layers {
+			if lm, ok := l.(map[string]any); ok {
+				name, _ := lm["name"].(string)
+				layer, _ := lm["layer"].(string)
+				reason, _ := lm["reason"].(string)
+				fmt.Printf("    %-20s %-10s %s\n", name, layer, reason)
+			}
+		}
+	}
+
+	if clusters, ok := data["clusters"].([]any); ok && len(clusters) > 0 {
+		fmt.Printf("  clusters (%d):\n", len(clusters))
+		for _, c := range clusters {
+			if cm, ok := c.(map[string]any); ok {
+				id := jsonInt(cm["id"])
+				label, _ := cm["label"].(string)
+				members := jsonInt(cm["members"])
+				cohesion, _ := cm["cohesion"].(float64)
+				fmt.Printf("    #%d %-25s %d members  cohesion=%.2f\n", id, label, members, cohesion)
+				if topNodes, ok := cm["top_nodes"].([]any); ok && len(topNodes) > 0 {
+					names := make([]string, 0, len(topNodes))
+					for _, tn := range topNodes {
+						if s, ok := tn.(string); ok {
+							names = append(names, s)
+						}
+					}
+					fmt.Printf("       top: %s\n", strings.Join(names, ", "))
+				}
+			}
+		}
+	}
+
+	if ft, ok := data["file_tree"].([]any); ok && len(ft) > 0 {
+		fmt.Printf("  file_tree (%d entries):\n", len(ft))
+		for _, f := range ft {
+			if fm, ok := f.(map[string]any); ok {
+				path, _ := fm["path"].(string)
+				ftype, _ := fm["type"].(string)
+				children := jsonInt(fm["children"])
+				if ftype == "dir" {
+					fmt.Printf("    %s/  (%d children)\n", path, children)
+				} else {
+					fmt.Printf("    %s\n", path)
+				}
+			}
+		}
+	}
+
+	if adr, ok := data["adr"].(map[string]any); ok {
+		updatedAt, _ := adr["updated_at"].(string)
+		fmt.Printf("  adr: (updated %s)\n", updatedAt)
+	} else if hint, ok := data["adr_hint"].(string); ok {
+		fmt.Printf("  adr: %s\n", hint)
+	}
+}
+
+func printADRSummary(data map[string]any) {
+	project, _ := data["project"].(string)
+	status, _ := data["status"].(string)
+
+	if status != "" {
+		fmt.Printf("ADR %s: %s\n", project, status)
+		if updatedAt, ok := data["updated_at"].(string); ok {
+			fmt.Printf("  updated_at: %s\n", updatedAt)
+		}
+		return
+	}
+
+	// mode=get response
+	if hint, ok := data["adr_hint"].(string); ok {
+		fmt.Printf("ADR %s: %s\n", project, hint)
+		return
+	}
+
+	if text, ok := data["text"].(string); ok && text != "" {
+		updatedAt, _ := data["updated_at"].(string)
+		fmt.Printf("ADR %s (updated %s):\n\n%s\n", project, updatedAt, text)
+	} else if sections, ok := data["sections"].(map[string]any); ok {
+		updatedAt, _ := data["updated_at"].(string)
+		fmt.Printf("ADR %s (updated %s):\n", project, updatedAt)
+		for name, content := range sections {
+			fmt.Printf("\n## %s\n%v\n", name, content)
+		}
 	}
 }
 

@@ -275,7 +275,7 @@ Every MCP tool can be invoked directly from the command line — no MCP client n
 codebase-memory-mcp cli <tool_name> [json_args]
 ```
 
-By default, the CLI prints a **human-friendly summary**. Use `--raw` for full JSON output (same format the MCP server returns).
+By default, the CLI prints a **human-friendly summary**. Use `--raw` for full output (YAML by default, same format the MCP server returns).
 
 ### Examples
 
@@ -351,6 +351,14 @@ The CLI uses the same SQLite database as the MCP server (`~/.cache/codebase-memo
 | Tool | Key Parameters | Description |
 |------|---------------|-------------|
 | `search_code` | `pattern` (required), `file_pattern`, `regex`, `case_sensitive`, `max_results` (default 100), `offset` | Grep-like text search within indexed project files. **Case-insensitive by default** (set `case_sensitive=true` for exact case). Supports pagination via `max_results`/`offset`. |
+
+### Configuration
+
+| Tool | Key Parameters | Description |
+|------|---------------|-------------|
+| `set_output_format` | `format` (required: `yaml` or `json`) | Set the output format for all tool responses. **Default: `yaml`** — compact output with readable multiline strings (ideal for code snippets). Use `json` for standard JSON with 2-space indentation. Persists for the session. |
+
+> **Output format**: All tool responses default to **YAML**, which is ~40% more compact than JSON and renders code snippets as readable block scalars instead of escaped strings. Switch to JSON with `set_output_format(format="json")` if your client expects JSON.
 
 ## Usage Examples
 

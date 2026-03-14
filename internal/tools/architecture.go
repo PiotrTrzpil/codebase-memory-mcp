@@ -40,7 +40,12 @@ func (s *Server) handleGetArchitecture(_ context.Context, req *mcp.CallToolReque
 		projName = projects[0].Name
 	}
 
-	info, err := st.GetArchitecture(projName, aspects)
+	archOpts := store.ArchOptions{
+		BoundaryPathPrefix: getStringArg(args, "boundary_path_prefix"),
+		BoundaryDepth:      getIntArg(args, "boundary_depth", 0),
+	}
+
+	info, err := st.GetArchitecture(projName, aspects, archOpts)
 	if err != nil {
 		return errResult(fmt.Sprintf("architecture: %v", err)), nil
 	}
@@ -49,7 +54,7 @@ func (s *Server) handleGetArchitecture(_ context.Context, req *mcp.CallToolReque
 	addADRToResponse(responseData, aspects, st, projName)
 
 	s.addIndexStatus(responseData)
-	result := jsonResult(responseData)
+	result := s.result(responseData)
 	s.addUpdateNotice(result)
 	return result, nil
 }
@@ -199,7 +204,7 @@ func (s *Server) handleADRGet(st *store.Store, projName string, include []string
 		if docs, findErr := st.FindArchitectureDocs(projName); findErr == nil && len(docs) > 0 {
 			hint += fmt.Sprintf(" Existing architecture docs found: %v — consider reading these first.", docs)
 		}
-		return jsonResult(map[string]any{
+		return s.result(map[string]any{
 			"project":  projName,
 			"adr":      nil,
 			"adr_hint": hint,
@@ -221,7 +226,7 @@ func (s *Server) handleADRGet(st *store.Store, projName string, include []string
 				filtered[name] = content
 			}
 		}
-		return jsonResult(map[string]any{
+		return s.result(map[string]any{
 			"project":        projName,
 			"sections":       filtered,
 			"updated_at":     adr.UpdatedAt,
@@ -229,7 +234,7 @@ func (s *Server) handleADRGet(st *store.Store, projName string, include []string
 		}), nil
 	}
 
-	return jsonResult(map[string]any{
+	return s.result(map[string]any{
 		"project":        projName,
 		"sections":       sections,
 		"text":           adr.Content,
@@ -251,7 +256,7 @@ func (s *Server) handleADRStore(st *store.Store, projName, content string) (*mcp
 	if err := st.StoreADR(projName, content); err != nil {
 		return errResult(fmt.Sprintf("store ADR: %v", err)), nil
 	}
-	return jsonResult(map[string]any{
+	return s.result(map[string]any{
 		"status":     "stored",
 		"project":    projName,
 		"updated_at": store.Now(),
@@ -270,7 +275,7 @@ func (s *Server) handleADRUpdate(st *store.Store, projName string, sections map[
 		return errResult(fmt.Sprintf("update ADR: %v", err)), nil
 	}
 	parsed := store.ParseADRSections(adr.Content)
-	return jsonResult(map[string]any{
+	return s.result(map[string]any{
 		"status":     "updated",
 		"project":    projName,
 		"sections":   parsed,
@@ -283,7 +288,7 @@ func (s *Server) handleADRDelete(st *store.Store, projName string) (*mcp.CallToo
 	if err := st.DeleteADR(projName); err != nil {
 		return errResult(fmt.Sprintf("delete ADR: %v", err)), nil
 	}
-	return jsonResult(map[string]any{
+	return s.result(map[string]any{
 		"status":  "deleted",
 		"project": projName,
 	}), nil

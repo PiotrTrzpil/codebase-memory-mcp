@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	baseInterval = 1 * time.Second
-	maxInterval  = 60 * time.Second
+	graceInterval = 5 * time.Second // delay before first poll to avoid startup contention
+	baseInterval  = 1 * time.Second
+	maxInterval   = 60 * time.Second
 )
 
 type fileSnapshot struct {
@@ -29,12 +30,17 @@ type projectState struct {
 // IndexFunc is the callback signature for triggering a re-index.
 type IndexFunc func(ctx context.Context, projectName, rootPath string) error
 
-// Watcher polls indexed projects for file changes and triggers re-indexing.
+// Watcher polls the session project for file changes and triggers re-indexing.
+// Each MCP server instance watches only its own project — not all projects.
 type Watcher struct {
 	router   *store.StoreRouter
 	indexFn  IndexFunc
 	projects map[string]*projectState
 	ctx      context.Context
+
+	// Session-scoped: only watch this project (set via SetSessionProject).
+	sessionProject string
+	sessionRoot    string
 }
 
 // New creates a Watcher. indexFn is called when file changes are detected.
@@ -46,10 +52,34 @@ func New(r *store.StoreRouter, indexFn IndexFunc) *Watcher {
 	}
 }
 
-// Run blocks until ctx is cancelled. Ticks at baseInterval, polling each
-// project only when its adaptive interval has elapsed.
+// SetSessionProject tells the watcher which project to monitor.
+// Must be called before Run. If not called, the watcher does nothing.
+func (w *Watcher) SetSessionProject(name, rootPath string) {
+	w.sessionProject = name
+	w.sessionRoot = rootPath
+}
+
+// Run blocks until ctx is cancelled. Ticks at baseInterval, polling the
+// session project only when its adaptive interval has elapsed.
+// Waits graceInterval before the first poll to avoid I/O during MCP startup.
 func (w *Watcher) Run(ctx context.Context) {
 	w.ctx = ctx
+
+	if w.sessionProject == "" || w.sessionRoot == "" {
+		slog.Debug("watcher.skip", "reason", "no_session_project")
+		// No session project — just block until cancelled.
+		<-ctx.Done()
+		return
+	}
+
+	// Grace period: let the MCP server finish initialization and first tool
+	// calls before we start opening databases and walking file trees.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(graceInterval):
+	}
+
 	ticker := time.NewTicker(baseInterval)
 	defer ticker.Stop()
 
@@ -58,45 +88,35 @@ func (w *Watcher) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			w.pollAll()
+			w.pollSession()
 		}
 	}
 }
 
-// pollAll lists all indexed projects and polls each that is due.
-func (w *Watcher) pollAll() {
-	projectInfos, err := w.router.ListProjects()
-	if err != nil {
-		slog.Warn("watcher.list_projects", "err", err)
-		return
-	}
+// pollSession polls only the session project for changes.
+func (w *Watcher) pollSession() {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("watcher.pollSession.panic", "panic", r)
+		}
+	}()
 
 	now := time.Now()
-	for _, info := range projectInfos {
-		// Get the store for this project (never cache directly)
-		st, stErr := w.router.ForProject(info.Name)
-		if stErr != nil {
-			continue
-		}
-
-		// Get the project metadata from the store
-		proj, projErr := st.GetProject(info.Name)
-		if projErr != nil || proj == nil {
-			continue
-		}
-
-		state, exists := w.projects[info.Name]
-		if !exists {
-			state = &projectState{}
-			w.projects[info.Name] = state
-		}
-
-		if exists && now.Before(state.nextPoll) {
-			continue // not due yet
-		}
-
-		w.pollProject(proj, state)
+	state, exists := w.projects[w.sessionProject]
+	if !exists {
+		state = &projectState{}
+		w.projects[w.sessionProject] = state
 	}
+
+	if exists && now.Before(state.nextPoll) {
+		return // not due yet
+	}
+
+	proj := &store.Project{
+		Name:     w.sessionProject,
+		RootPath: w.sessionRoot,
+	}
+	w.pollProject(proj, state)
 }
 
 // pollProject captures a snapshot of the file tree and compares with previous.

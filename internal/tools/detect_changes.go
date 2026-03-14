@@ -32,6 +32,14 @@ func (s *Server) registerDetectChanges() {
 					"type": "integer",
 					"description": "Maximum BFS depth for impact tracing (1-5, default 3)"
 				},
+				"max_impact": {
+					"type": "integer",
+					"description": "Maximum number of impacted symbols to return (default: 50). Large diffs can produce thousands of impacted symbols. Use a lower value to keep output within context window limits."
+				},
+				"summary_only": {
+					"type": "boolean",
+					"description": "When true, return only the summary counts (changed files, symbols, risk breakdown) without full symbol/file lists. Useful for quick triage."
+				},
 				"project": {
 					"type": "string",
 					"description": "Project to analyze. Defaults to session project."
@@ -62,6 +70,13 @@ func (s *Server) handleDetectChanges(_ context.Context, req *mcp.CallToolRequest
 		depth = 5
 	}
 
+	maxImpact := getIntArg(args, "max_impact", 50)
+	if maxImpact < 1 {
+		maxImpact = 1
+	}
+
+	summaryOnly := getBoolArg(args, "summary_only")
+
 	project := getStringArg(args, "project")
 	effectiveProject := s.resolveProjectName(project)
 
@@ -90,15 +105,31 @@ func (s *Server) handleDetectChanges(_ context.Context, req *mcp.CallToolRequest
 	impactedSymbols, allEdges := traceImpact(st, changedSymbols, depth)
 	summary := buildDetectSummary(changedFiles, changedSymbols, impactedSymbols, allEdges)
 
+	if summaryOnly {
+		responseData := map[string]any{"summary": summary}
+		s.addIndexStatus(responseData)
+		result := s.result(responseData)
+		s.addUpdateNotice(result)
+		return result, nil
+	}
+
+	// Cap impacted symbols output (summary still reflects the full set)
+	displayImpacted := impactedSymbols
+	if len(displayImpacted) > maxImpact {
+		displayImpacted = displayImpacted[:maxImpact]
+		summary["truncated"] = true
+		summary["max_impact"] = maxImpact
+	}
+
 	responseData := map[string]any{
 		"changed_files":    buildFileList(changedFiles),
 		"changed_symbols":  buildSymbolList(changedSymbols),
-		"impacted_symbols": buildImpactList(impactedSymbols),
+		"impacted_symbols": buildImpactList(displayImpacted),
 		"summary":          summary,
 	}
 	s.addIndexStatus(responseData)
 
-	result := jsonResult(responseData)
+	result := s.result(responseData)
 	s.addUpdateNotice(result)
 	return result, nil
 }
@@ -146,7 +177,7 @@ func (s *Server) emptyDetectResponse() *mcp.CallToolResult {
 		},
 	}
 	s.addIndexStatus(responseData)
-	result := jsonResult(responseData)
+	result := s.result(responseData)
 	s.addUpdateNotice(result)
 	return result
 }
@@ -167,12 +198,10 @@ func buildSymbolList(symbols []*store.Node) []map[string]any {
 	result := make([]map[string]any, len(symbols))
 	for i, n := range symbols {
 		result[i] = map[string]any{
-			"name":           n.Name,
-			"qualified_name": n.QualifiedName,
-			"label":          n.Label,
-			"file_path":      n.FilePath,
-			"start_line":     n.StartLine,
-			"end_line":       n.EndLine,
+			"name":  n.Name,
+			"label": n.Label,
+			"file":  n.FilePath,
+			"lines": fmt.Sprintf("%d-%d", n.StartLine, n.EndLine),
 		}
 	}
 	return result
@@ -182,13 +211,12 @@ func buildImpactList(impacted []impactedSymbol) []map[string]any {
 	result := make([]map[string]any, len(impacted))
 	for i, is := range impacted {
 		result[i] = map[string]any{
-			"name":           is.Node.Name,
-			"qualified_name": is.Node.QualifiedName,
-			"label":          is.Node.Label,
-			"file_path":      is.Node.FilePath,
-			"risk":           string(store.HopToRisk(is.Hop)),
-			"hop":            is.Hop,
-			"changed_by":     is.ChangedBy,
+			"name":       is.Node.Name,
+			"label":      is.Node.Label,
+			"file":       is.Node.FilePath,
+			"risk":       string(store.HopToRisk(is.Hop)),
+			"hop":        is.Hop,
+			"changed_by": is.ChangedBy,
 		}
 	}
 	return result

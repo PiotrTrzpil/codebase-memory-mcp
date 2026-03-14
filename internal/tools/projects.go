@@ -61,7 +61,7 @@ func (s *Server) handleListProjects(_ context.Context, _ *mcp.CallToolRequest) (
 		result = append(result, entry)
 	}
 
-	return jsonResult(result), nil
+	return s.result(result), nil
 }
 
 func (s *Server) handleDeleteProject(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -84,7 +84,7 @@ func (s *Server) handleDeleteProject(_ context.Context, req *mcp.CallToolRequest
 		return errResult(fmt.Sprintf("delete failed: %v", err)), nil
 	}
 
-	return jsonResult(map[string]any{
+	return s.result(map[string]any{
 		"deleted": name,
 		"status":  "ok",
 	}), nil
@@ -101,7 +101,7 @@ func (s *Server) handleIndexStatus(_ context.Context, req *mcp.CallToolRequest) 
 		projectName = s.sessionProject
 	}
 	if projectName == "" {
-		return jsonResult(map[string]any{
+		return s.result(map[string]any{
 			"status":  "no_session",
 			"message": "No session project detected. Pass 'project' parameter or ensure the MCP client provides roots.",
 		}), nil
@@ -109,7 +109,7 @@ func (s *Server) handleIndexStatus(_ context.Context, req *mcp.CallToolRequest) 
 
 	// Check if DB file exists
 	if !s.router.HasProject(projectName) {
-		return jsonResult(map[string]any{
+		return s.result(map[string]any{
 			"project": projectName,
 			"status":  "not_indexed",
 			"message": fmt.Sprintf("No index found for project %q. Call index_repository to create one.", projectName),
@@ -126,7 +126,7 @@ func (s *Server) handleIndexStatus(_ context.Context, req *mcp.CallToolRequest) 
 	proj, _ := st.GetProject(projectName)
 	if proj == nil {
 		// DB file exists but no project row — partially indexed or corrupted
-		return jsonResult(map[string]any{
+		return s.result(map[string]any{
 			"project": projectName,
 			"status":  "partial",
 			"message": "Database file exists but project metadata is missing. Re-run index_repository.",
@@ -171,5 +171,5 @@ func (s *Server) handleIndexStatus(_ context.Context, req *mcp.CallToolRequest) 
 		}
 	}
 
-	return jsonResult(result), nil
+	return s.result(result), nil
 }

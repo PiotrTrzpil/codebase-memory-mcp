@@ -14,9 +14,10 @@ import (
 )
 
 type codeMatch struct {
-	File    string `json:"file"`
-	Line    int    `json:"line"`
-	Content string `json:"content"`
+	File    string   `json:"file"`
+	Line    int      `json:"line"`
+	Content string   `json:"content"`
+	Context []string `json:"context,omitempty"`
 }
 
 // searchCodeParams holds parsed parameters for a code search request.
@@ -25,6 +26,7 @@ type searchCodeParams struct {
 	fileGlob      string
 	maxResults    int
 	offset        int
+	contextLines  int
 	isRegex       bool
 	caseSensitive bool
 	re            *regexp.Regexp
@@ -38,11 +40,20 @@ func parseSearchCodeParams(req *mcp.CallToolRequest) (*searchCodeParams, *mcp.Ca
 		return nil, errResult(err.Error())
 	}
 
+	contextLines := getIntArg(args, "context_lines", 2)
+	if contextLines < 0 {
+		contextLines = 0
+	}
+	if contextLines > 5 {
+		contextLines = 5
+	}
+
 	p := &searchCodeParams{
 		pattern:       getStringArg(args, "pattern"),
 		fileGlob:      getStringArg(args, "file_pattern"),
 		maxResults:    getIntArg(args, "max_results", 10),
 		offset:        getIntArg(args, "offset", 0),
+		contextLines:  contextLines,
 		isRegex:       getBoolArg(args, "regex"),
 		caseSensitive: getBoolArg(args, "case_sensitive"),
 		project:       getStringArg(args, "project"),
@@ -83,21 +94,35 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 
 	filePaths := s.collectSearchFilePaths(params.fileGlob, params.project)
 
-	// Collect all matches up to offset+maxResults for accurate total count
+	// Two-pass approach: first count total matches, then collect the page with context.
+	// Pass 1: count all matches across all files.
+	totalMatches := 0
+	type fileMatchInfo struct {
+		relPath string
+		absPath string
+	}
+	var matchFiles []fileMatchInfo
+	for _, relPath := range filePaths {
+		absPath := filepath.Join(root, relPath)
+		n := countFileMatches(absPath, params.pattern, params.re, params.isRegex, params.caseSensitive)
+		if n > 0 {
+			totalMatches += n
+			matchFiles = append(matchFiles, fileMatchInfo{relPath, absPath})
+		}
+	}
+
+	// Pass 2: collect the requested page of results (with optional context lines).
 	fetchLimit := params.offset + params.maxResults
 	var allMatches []codeMatch
-	for _, relPath := range filePaths {
+	for _, fi := range matchFiles {
 		if len(allMatches) >= fetchLimit {
 			break
 		}
-
-		absPath := filepath.Join(root, relPath)
-		fileMatches := searchFile(absPath, relPath, params.pattern, params.re, params.isRegex, params.caseSensitive, fetchLimit-len(allMatches))
+		fileMatches := searchFile(fi.absPath, fi.relPath, params.pattern, params.re, params.isRegex, params.caseSensitive, fetchLimit-len(allMatches), params.contextLines)
 		allMatches = append(allMatches, fileMatches...)
 	}
 
 	total := len(allMatches)
-	hasMore := total >= fetchLimit
 
 	// Apply offset and limit
 	start := params.offset
@@ -111,17 +136,17 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 	pageMatches := allMatches[start:end]
 
 	responseData := map[string]any{
-		"pattern":     params.pattern,
-		"total":       total,
-		"limit":       params.maxResults,
-		"offset":      params.offset,
-		"has_more":    hasMore,
-		"matches":     pageMatches,
-		"files_count": len(filePaths),
+		"pattern":       params.pattern,
+		"total_matches": totalMatches,
+		"limit":         params.maxResults,
+		"offset":        params.offset,
+		"has_more":      params.offset+params.maxResults < totalMatches,
+		"matches":       pageMatches,
+		"files_count":   len(filePaths),
 	}
 	s.addIndexStatus(responseData)
 
-	result := jsonResult(responseData)
+	result := s.result(responseData)
 	s.addUpdateNotice(result)
 	return result, nil
 }
@@ -164,12 +189,49 @@ func (s *Server) collectSearchFilePaths(fileGlob, project string) []string {
 	return filePaths
 }
 
-func searchFile(absPath, relPath, pattern string, re *regexp.Regexp, isRegex, caseSensitive bool, limit int) []codeMatch {
+// matchLine checks whether a single line matches the search criteria.
+func matchLine(line, pattern string, re *regexp.Regexp, isRegex, caseSensitive bool) bool {
+	switch {
+	case isRegex:
+		return re.MatchString(line)
+	case caseSensitive:
+		return strings.Contains(line, pattern)
+	default:
+		return strings.Contains(strings.ToLower(line), pattern)
+	}
+}
+
+// countFileMatches returns the total number of matching lines in a file without
+// collecting results. Used for accurate total_matches counts.
+func countFileMatches(absPath, pattern string, re *regexp.Regexp, isRegex, caseSensitive bool) int {
+	f, err := os.Open(absPath)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	count := 0
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		if matchLine(scanner.Text(), pattern, re, isRegex, caseSensitive) {
+			count++
+		}
+	}
+	return count
+}
+
+func searchFile(absPath, relPath, pattern string, re *regexp.Regexp, isRegex, caseSensitive bool, limit, contextLines int) []codeMatch {
 	f, err := os.Open(absPath)
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
+
+	// When context is requested, read all lines first so we can look ahead/behind.
+	if contextLines > 0 {
+		return searchFileWithContext(f, relPath, pattern, re, isRegex, caseSensitive, limit, contextLines)
+	}
 
 	var matches []codeMatch
 	scanner := bufio.NewScanner(f)
@@ -180,18 +242,7 @@ func searchFile(absPath, relPath, pattern string, re *regexp.Regexp, isRegex, ca
 		lineNum++
 		line := scanner.Text()
 
-		var found bool
-		switch {
-		case isRegex:
-			found = re.MatchString(line)
-		case caseSensitive:
-			found = strings.Contains(line, pattern)
-		default:
-			// pattern already lowercased in parseSearchCodeParams
-			found = strings.Contains(strings.ToLower(line), pattern)
-		}
-
-		if found {
+		if matchLine(line, pattern, re, isRegex, caseSensitive) {
 			content := strings.TrimSpace(line)
 			if len(content) > 200 {
 				content = content[:200] + "..."
@@ -204,6 +255,65 @@ func searchFile(absPath, relPath, pattern string, re *regexp.Regexp, isRegex, ca
 			if len(matches) >= limit {
 				break
 			}
+		}
+	}
+
+	return matches
+}
+
+// searchFileWithContext reads the full file into memory and returns matches
+// with surrounding context lines (before + after).
+func searchFileWithContext(f *os.File, relPath, pattern string, re *regexp.Regexp, isRegex, caseSensitive bool, limit, contextLines int) []codeMatch {
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	var matches []codeMatch
+	for i, line := range lines {
+		if !matchLine(line, pattern, re, isRegex, caseSensitive) {
+			continue
+		}
+
+		content := strings.TrimSpace(line)
+		if len(content) > 200 {
+			content = content[:200] + "..."
+		}
+
+		// Gather context: before and after lines
+		ctxStart := i - contextLines
+		if ctxStart < 0 {
+			ctxStart = 0
+		}
+		ctxEnd := i + contextLines
+		if ctxEnd >= len(lines) {
+			ctxEnd = len(lines) - 1
+		}
+
+		ctx := make([]string, 0, ctxEnd-ctxStart+1)
+		for j := ctxStart; j <= ctxEnd; j++ {
+			if j == i {
+				continue // skip the match line itself, it's in Content
+			}
+			prefix := " "
+			cl := lines[j]
+			if len(cl) > 200 {
+				cl = cl[:200] + "..."
+			}
+			ctx = append(ctx, fmt.Sprintf("%s%d: %s", prefix, j+1, cl))
+		}
+
+		matches = append(matches, codeMatch{
+			File:    relPath,
+			Line:    i + 1,
+			Content: content,
+			Context: ctx,
+		})
+		if len(matches) >= limit {
+			break
 		}
 	}
 

@@ -100,5 +100,5 @@ func (s *Server) handleIndexRepository(ctx context.Context, req *mcp.CallToolReq
 		result["adr_hint"] = "Project indexed. Consider creating an Architecture Decision Record: explore the codebase with get_architecture(aspects=['all']), then use manage_adr(mode='store') to persist architectural insights across sessions."
 	}
 
-	return jsonResult(result), nil
+	return s.result(result), nil
 }

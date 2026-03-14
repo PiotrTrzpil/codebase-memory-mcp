@@ -55,8 +55,8 @@ func (s *Server) handleGetCodeSnippet(_ context.Context, req *mcp.CallToolReques
 		for _, c := range candidates {
 			if c.ID != match.node.ID {
 				alternatives = append(alternatives, map[string]string{
-					"qualified_name": c.QualifiedName,
-					"file_path":      c.FilePath,
+					"name": c.Name,
+					"file": c.FilePath,
 				})
 			}
 		}
@@ -112,13 +112,12 @@ func (s *Server) buildSnippetResponse(match *snippetMatch, includeNeighbors bool
 
 	// Build enriched response
 	responseData := map[string]any{
-		"qualified_name": node.QualifiedName,
-		"name":           node.Name,
-		"label":          node.Label,
-		"file_path":      absPath,
-		"start_line":     node.StartLine,
-		"end_line":       node.EndLine,
-		"source":         source,
+		"qn":     stripQNPrefix(node.QualifiedName, foundProject),
+		"name":   node.Name,
+		"label":  node.Label,
+		"file":   node.FilePath,
+		"lines":  fmt.Sprintf("%d-%d", node.StartLine, node.EndLine),
+		"source": source,
 	}
 
 	// Add all non-empty node properties
@@ -154,7 +153,7 @@ func (s *Server) buildSnippetResponse(match *snippetMatch, includeNeighbors bool
 		responseData["alternatives"] = alternatives
 	}
 
-	return jsonResult(responseData), nil
+	return s.result(responseData), nil
 }
 
 // autoResolveBest picks the best candidate from a small set (<=2).
@@ -276,15 +275,14 @@ func (s *Server) snippetSuggestions(input string, nodes []*store.Node) *mcp.Call
 	suggList := make([]map[string]string, 0, len(nodes))
 	for _, n := range nodes {
 		suggList = append(suggList, map[string]string{
-			"qualified_name": n.QualifiedName,
-			"name":           n.Name,
-			"label":          n.Label,
-			"file_path":      n.FilePath,
+			"name":  n.Name,
+			"label": n.Label,
+			"file":  n.FilePath,
 		})
 	}
-	return jsonResult(map[string]any{
+	return s.result(map[string]any{
 		"status":      "ambiguous",
-		"message":     fmt.Sprintf("%d matches found for %q — use a qualified_name from the suggestions to disambiguate", len(nodes), input),
+		"message":     fmt.Sprintf("%d matches for %q — pass file:name to disambiguate (e.g. %s:%s)", len(nodes), input, nodes[0].FilePath, nodes[0].Name),
 		"suggestions": suggList,
 	})
 }

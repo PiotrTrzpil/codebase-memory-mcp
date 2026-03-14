@@ -22,6 +22,7 @@ import (
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
 	"github.com/DeusData/codebase-memory-mcp/internal/watcher"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"gopkg.in/yaml.v3"
 )
 
 // Version is the current release version, set from main.version via SetVersion().
@@ -49,6 +50,12 @@ type Server struct {
 	indexStatus    atomic.Value
 	indexStartedAt atomic.Value // time.Time — when current/last index started
 	updateNotice   atomic.Value // string — set once by checkForUpdate, cleared after first injection
+
+	// Watcher lifecycle (deferred until after MCP handshake)
+	watcherOnce sync.Once
+	watcherCtx  context.Context
+
+	outputFormat atomic.Value // "json" (default) or "yaml"
 }
 
 // NewServer creates a new MCP server with all tools registered.
@@ -57,6 +64,7 @@ func NewServer(r *store.StoreRouter) *Server {
 		router:   r,
 		handlers: make(map[string]mcp.ToolHandler),
 	}
+	srv.outputFormat.Store("yaml")
 
 	srv.mcp = mcp.NewServer(
 		&mcp.Implementation{
@@ -77,7 +85,29 @@ func NewServer(r *store.StoreRouter) *Server {
 // StartWatcher launches the background file-change polling goroutine.
 // It stops when ctx is cancelled.
 func (s *Server) StartWatcher(ctx context.Context) {
-	go s.watcher.Run(ctx)
+	s.watcherCtx = ctx
+}
+
+// startWatcherNow starts the watcher goroutine. Called after MCP initialization
+// so database I/O doesn't compete with the handshake.
+func (s *Server) startWatcherNow() {
+	s.watcherOnce.Do(func() {
+		if s.watcherCtx != nil && s.sessionProject != "" && s.sessionRoot != "" {
+			s.watcher.SetSessionProject(s.sessionProject, s.sessionRoot)
+			go s.safeGo("watcher", func() { s.watcher.Run(s.watcherCtx) })
+		}
+	})
+}
+
+// safeGo runs fn with panic recovery so a goroutine crash doesn't kill the
+// MCP server process. The label is used for logging.
+func (s *Server) safeGo(label string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("goroutine.panic", "label", label, "panic", r)
+		}
+	}()
+	fn()
 }
 
 // syncProject is called by the watcher when file changes are detected.
@@ -113,7 +143,7 @@ func (s *Server) SessionProject() string {
 
 // SetSessionRoot sets the session root path directly (for CLI mode).
 func (s *Server) SetSessionRoot(rootPath string) {
-	go s.checkForUpdate()
+	go s.safeGo("checkForUpdate", s.checkForUpdate)
 	s.sessionOnce.Do(func() {
 		s.sessionRoot = rootPath
 		if rootPath != "" {
@@ -126,7 +156,7 @@ func (s *Server) SetSessionRoot(rootPath string) {
 
 // onInitialized is called when the client sends notifications/initialized.
 func (s *Server) onInitialized(ctx context.Context, req *mcp.InitializedRequest) {
-	go s.checkForUpdate()
+	go s.safeGo("checkForUpdate", s.checkForUpdate)
 	s.sessionOnce.Do(func() {
 		s.sessionRoot = s.detectSessionRoot(ctx, req.Session)
 		if s.sessionRoot != "" {
@@ -134,11 +164,12 @@ func (s *Server) onInitialized(ctx context.Context, req *mcp.InitializedRequest)
 			s.startAutoIndex()
 		}
 	})
+	s.startWatcherNow()
 }
 
 // onRootsChanged re-detects session root if not yet set.
 func (s *Server) onRootsChanged(ctx context.Context, req *mcp.RootsListChangedRequest) {
-	go s.checkForUpdate()
+	go s.safeGo("checkForUpdate", s.checkForUpdate)
 	s.sessionOnce.Do(func() {
 		s.sessionRoot = s.detectSessionRoot(ctx, req.Session)
 		if s.sessionRoot != "" {
@@ -146,6 +177,7 @@ func (s *Server) onRootsChanged(ctx context.Context, req *mcp.RootsListChangedRe
 			s.startAutoIndex()
 		}
 	})
+	s.startWatcherNow()
 }
 
 // detectSessionRoot tries multiple fallback strategies to find the project root.
@@ -203,7 +235,7 @@ func (s *Server) startAutoIndex() {
 		s.indexStatus.Store("ready")
 	}
 
-	go func() {
+	go s.safeGo("autoindex", func() {
 		if !s.indexMu.TryLock() {
 			slog.Debug("autoindex.skip", "reason", "index_in_progress")
 			return
@@ -227,7 +259,7 @@ func (s *Server) startAutoIndex() {
 		}
 		s.indexStatus.Store("ready")
 		slog.Info("autoindex.done", "project", s.sessionProject)
-	}()
+	})
 }
 
 // --- Store routing ---
@@ -381,6 +413,42 @@ func (s *Server) registerTools() {
 	s.registerTraceTools()
 	s.registerDetectChanges()
 	s.registerArchitectureTools()
+	s.registerConfigTools()
+}
+
+func (s *Server) registerConfigTools() {
+	s.addTool(&mcp.Tool{
+		Name:        "set_output_format",
+		Description: "Set the output format for all tool responses. 'yaml' (default): compact YAML output with readable multiline strings — ideal for code snippets and paths. 'json': standard JSON with 2-space indentation. The chosen format persists for the session.",
+		InputSchema: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"format": {
+					"type": "string",
+					"enum": ["json", "yaml"],
+					"description": "Output format: 'json' or 'yaml'"
+				}
+			},
+			"required": ["format"]
+		}`),
+	}, s.handleSetOutputFormat)
+}
+
+func (s *Server) handleSetOutputFormat(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := parseArgs(req)
+	if err != nil {
+		return errResult("bad args: " + err.Error()), nil
+	}
+	format, _ := args["format"].(string)
+	if format != "json" && format != "yaml" {
+		return errResult("format must be 'json' or 'yaml'"), nil
+	}
+	s.outputFormat.Store(format)
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: "output format set to " + format},
+		},
+	}, nil
 }
 
 func (s *Server) registerArchitectureTools() {
@@ -394,6 +462,14 @@ func (s *Server) registerArchitectureTools() {
 					"type": "array",
 					"items": {"type": "string", "enum": ["all", "languages", "packages", "entry_points", "routes", "hotspots", "boundaries", "services", "layers", "clusters", "file_tree", "adr"]},
 					"description": "Which architecture aspects to return. Default: ['all']. Use specific aspects to reduce output: ['languages', 'packages'] for quick orientation, ['hotspots', 'boundaries'] for dependency analysis, ['clusters'] for community detection across CALLS/HTTP/ASYNC edges."
+				},
+				"boundary_depth": {
+					"type": "integer",
+					"description": "Directory depth for sub-package boundary analysis (only affects 'boundaries' aspect). When used with boundary_path_prefix, depth is RELATIVE to the prefix (depth=1 = one level below prefix). Without prefix, depth is absolute from repo root. Default: 1."
+				},
+				"boundary_path_prefix": {
+					"type": "string",
+					"description": "Filter boundaries to nodes whose file_path starts with this prefix (e.g. 'src/', 'lib/services/'). Implies file-path based grouping. Use with boundary_depth to zoom into sub-package boundaries within a directory."
 				},
 				"project": {
 					"type": "string",
@@ -468,7 +544,7 @@ func (s *Server) registerIndexAndTraceTool() {
 
 	s.addTool(&mcp.Tool{
 		Name:        "trace_call_path",
-		Description: "Trace the call path of a function (who calls it, what it calls). Requires exact function name — use search_graph first to find the exact name. Follow up with get_code_snippet to read the actual source code. Returns hop-by-hop callees/callers with edge types (CALLS, HTTP_CALLS, ASYNC_CALLS, USAGE, OVERRIDE). If the function is not found, returns suggestions of similar names — use the qualified_name from suggestions in a retry. Use depth=1 first, increase only if needed. Use direction='both' for full cross-service context — HTTP_CALLS edges from other services appear as inbound edges, so direction='outbound' alone misses cross-service callers. Best practice: search_graph(name_pattern='.*Order.*') → trace_call_path(function_name='processOrder') → get_code_snippet(qualified_name='...')",
+		Description: "Trace the call path of a function (who calls it, what it calls). Requires exact function name — use search_graph first to find the exact name. Follow up with get_code_snippet to read the actual source code. Returns hop-by-hop callees/callers with edge types (CALLS, HTTP_CALLS, ASYNC_CALLS, USAGE, OVERRIDE). If the function is not found, returns suggestions of similar names — use the qualified_name from suggestions in a retry. Use depth=1 first, increase only if needed. Use direction='both' for full cross-service context — HTTP_CALLS edges from other services appear as inbound edges, so direction='outbound' alone misses cross-service callers. Use summary_only=true for a compact overview (hop counts + edge type distribution) without listing all nodes — ideal for triage. Use max_results to control output size (default 50, max 200). Best practice: search_graph(name_pattern='.*Order.*') → trace_call_path(function_name='processOrder') → get_code_snippet(qualified_name='...')",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -492,6 +568,14 @@ func (s *Server) registerIndexAndTraceTool() {
 				"min_confidence": {
 					"type": "number",
 					"description": "Minimum confidence threshold (0.0-1.0) for CALLS edges. Filters out low-confidence fuzzy matches. Bands: high (>=0.7), medium (>=0.45), speculative (<0.45). Default 0 (no filter)."
+				},
+				"max_results": {
+					"type": "integer",
+					"description": "Maximum number of nodes to return from BFS (1-200, default 50). Use lower values for large call graphs to keep output manageable. Use 200 for exhaustive analysis."
+				},
+				"summary_only": {
+					"type": "boolean",
+					"description": "When true, return only a compact summary with hop counts and edge type distribution instead of listing all nodes and edges. Useful for triage — see total fan-out/fan-in at a glance without flooding context. Default false."
 				},
 				"project": {
 					"type": "string",
@@ -626,7 +710,7 @@ func (s *Server) registerSearchTools() {
 
 	s.addTool(&mcp.Tool{
 		Name:        "search_code",
-		Description: "Search for text in source code files (like grep, scoped to indexed project). Search is case-insensitive by default (set case_sensitive=true for exact case). With regex=true, use alternatives for broad matching: 'TODO|FIXME|HACK|WORKAROUND' (issue markers), 'sponsor|sponsoring|sponsored' (word forms), 'import|require|include' (cross-language patterns). Returns matching lines with file path, line number, and context. Returns 10 matches per page — use offset to paginate, has_more indicates more pages. Use for: string literals, error messages, TODO comments, config values, import statements. Prefer search_graph for finding functions/classes by name — search_code is for text content that isn't in the graph.",
+		Description: "Search for text in source code files (like grep, scoped to indexed project). Search is case-insensitive by default (set case_sensitive=true for exact case). With regex=true, use alternatives for broad matching: 'TODO|FIXME|HACK|WORKAROUND' (issue markers), 'sponsor|sponsoring|sponsored' (word forms), 'import|require|include' (cross-language patterns). Returns matching lines with file path, line number, and context. Returns 10 matches per page — use offset to paginate, has_more indicates more pages. Response includes total_matches (exact count across all files). Use context_lines to include surrounding lines (like grep -C). Use for: string literals, error messages, TODO comments, config values, import statements. Prefer search_graph for finding functions/classes by name — search_code is for text content that isn't in the graph.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -649,6 +733,10 @@ func (s *Server) registerSearchTools() {
 				"offset": {
 					"type": "integer",
 					"description": "Skip N matches for pagination (default: 0). Check has_more in response."
+				},
+				"context_lines": {
+					"type": "integer",
+					"description": "Number of lines to show before and after each match (0-5, default: 2). Like grep -C. Set to 0 for compact output."
 				},
 				"case_sensitive": {
 					"type": "boolean",
@@ -725,11 +813,42 @@ func (s *Server) registerProjectTools() {
 
 // --- Helpers ---
 
+// stripQNPrefix removes the project name prefix from a qualified name
+// to produce a shorter, more readable path (e.g., "src.views.use-map-view.loadMap").
+func stripQNPrefix(qn, projectName string) string {
+	if after, ok := strings.CutPrefix(qn, projectName+"."); ok {
+		return after
+	}
+	return qn
+}
+
+// result marshals data in the configured output format (json or yaml).
+func (s *Server) result(data any) *mcp.CallToolResult {
+	format, _ := s.outputFormat.Load().(string)
+	if format == "yaml" {
+		return yamlResult(data)
+	}
+	return jsonResult(data)
+}
+
 // jsonResult marshals data to JSON and returns as tool result.
 func jsonResult(data any) *mcp.CallToolResult {
 	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return errResult("json marshal err=" + err.Error())
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: string(b)},
+		},
+	}
+}
+
+// yamlResult marshals data to YAML and returns as tool result.
+func yamlResult(data any) *mcp.CallToolResult {
+	b, err := yaml.Marshal(data)
+	if err != nil {
+		return errResult("yaml marshal err=" + err.Error())
 	}
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{

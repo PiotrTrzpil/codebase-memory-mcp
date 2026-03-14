@@ -52,5 +52,5 @@ func (s *Server) handleIngestTraces(_ context.Context, req *mcp.CallToolRequest)
 		return errResult(err.Error()), nil
 	}
 
-	return jsonResult(result), nil
+	return s.result(result), nil
 }

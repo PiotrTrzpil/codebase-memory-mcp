@@ -29,6 +29,16 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 		depth = 5
 	}
 
+	maxResults := getIntArg(args, "max_results", 50)
+	if maxResults < 1 {
+		maxResults = 1
+	}
+	if maxResults > 200 {
+		maxResults = 200
+	}
+
+	summaryOnly := getBoolArg(args, "summary_only")
+
 	direction := getStringArg(args, "direction")
 	if direction == "" {
 		direction = "outbound"
@@ -52,12 +62,12 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 			suggList := make([]map[string]string, len(suggestions))
 			for i, n := range suggestions {
 				suggList[i] = map[string]string{
-					"name":           n.Name,
-					"qualified_name": n.QualifiedName,
-					"label":          n.Label,
+					"name":  n.Name,
+					"label": n.Label,
+					"file":  n.FilePath,
 				}
 			}
-			return jsonResult(map[string]any{
+			return s.result(map[string]any{
 				"status":      "not_found",
 				"message":     fmt.Sprintf("function not found: %s — use a name from the suggestions below", funcName),
 				"suggestions": suggList,
@@ -74,13 +84,25 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 
 	edgeTypes := []string{"CALLS", "HTTP_CALLS", "ASYNC_CALLS"}
 
-	allVisited, allEdges, bfsErr := runTraceBFS(st, rootNode.ID, direction, edgeTypes, depth, minConfidence)
+	allVisited, allEdges, bfsErr := runTraceBFS(st, rootNode.ID, direction, edgeTypes, depth, minConfidence, maxResults)
 	if bfsErr != nil {
 		return errResult(fmt.Sprintf("bfs err: %v", bfsErr)), nil
 	}
 
 	if riskLabels {
 		allVisited = store.DeduplicateHops(allVisited)
+	}
+
+	// Summary-only mode: return compact output with hop counts and edge type distribution
+	if summaryOnly {
+		responseData := buildTraceSummary(st, rootNode, foundProject, allVisited, allEdges)
+		if riskLabels {
+			responseData["impact_summary"] = store.BuildImpactSummary(allVisited, allEdges)
+		}
+		s.addIndexStatus(responseData)
+		result := s.result(responseData)
+		s.addUpdateNotice(result)
+		return result, nil
 	}
 
 	var hops []hopEntry
@@ -97,21 +119,21 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 	responseData["module"] = s.getModuleInfo(st, rootNode, foundProject)
 	s.addIndexStatus(responseData)
 
-	result := jsonResult(responseData)
+	result := s.result(responseData)
 	s.addUpdateNotice(result)
 	return result, nil
 }
 
-func runTraceBFS(st *store.Store, rootID int64, direction string, edgeTypes []string, depth int, minConfidence float64) ([]*store.NodeHop, []store.EdgeInfo, error) {
+func runTraceBFS(st *store.Store, rootID int64, direction string, edgeTypes []string, depth int, minConfidence float64, maxResults int) ([]*store.NodeHop, []store.EdgeInfo, error) {
 	if direction == "both" {
 		var allVisited []*store.NodeHop
 		var allEdges []store.EdgeInfo
-		outResult, outErr := st.BFS(rootID, "outbound", edgeTypes, depth, 200)
+		outResult, outErr := st.BFS(rootID, "outbound", edgeTypes, depth, maxResults)
 		if outErr == nil {
 			allVisited = append(allVisited, outResult.Visited...)
 			allEdges = append(allEdges, outResult.Edges...)
 		}
-		inResult, inErr := st.BFS(rootID, "inbound", edgeTypes, depth, 200)
+		inResult, inErr := st.BFS(rootID, "inbound", edgeTypes, depth, maxResults)
 		if inErr == nil {
 			allVisited = append(allVisited, inResult.Visited...)
 			allEdges = append(allEdges, inResult.Edges...)
@@ -121,7 +143,7 @@ func runTraceBFS(st *store.Store, rootID int64, direction string, edgeTypes []st
 		}
 		return allVisited, allEdges, nil
 	}
-	result, err := st.BFS(rootID, direction, edgeTypes, depth, 200)
+	result, err := st.BFS(rootID, direction, edgeTypes, depth, maxResults)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -145,28 +167,20 @@ func filterEdgesByConfidence(edges []store.EdgeInfo, minConfidence float64) []st
 }
 
 func buildTraceResponse(st *store.Store, rootNode *store.Node, project string, hops []hopEntry, visited []*store.NodeHop, edges []store.EdgeInfo) map[string]any {
-	proj, _ := st.GetProject(project)
-	indexedAt := ""
-	if proj != nil {
-		indexedAt = proj.IndexedAt
-	}
 	return map[string]any{
 		"root":          buildNodeInfo(rootNode),
 		"hops":          hops,
 		"edges":         buildEdgeList(edges),
-		"indexed_at":    indexedAt,
 		"total_results": len(visited),
 	}
 }
 
 func buildNodeInfo(n *store.Node) map[string]any {
 	info := map[string]any{
-		"name":           n.Name,
-		"qualified_name": n.QualifiedName,
-		"label":          n.Label,
-		"file_path":      n.FilePath,
-		"start_line":     n.StartLine,
-		"end_line":       n.EndLine,
+		"name":  n.Name,
+		"label": n.Label,
+		"file":  n.FilePath,
+		"lines": fmt.Sprintf("%d-%d", n.StartLine, n.EndLine),
 	}
 	if sig, ok := n.Properties["signature"]; ok {
 		info["signature"] = sig
@@ -208,9 +222,8 @@ func buildHops(visited []*store.NodeHop) []hopEntry {
 	hopMap := map[int][]map[string]any{}
 	for _, nh := range visited {
 		info := map[string]any{
-			"name":           nh.Node.Name,
-			"qualified_name": nh.Node.QualifiedName,
-			"label":          nh.Node.Label,
+			"name":  nh.Node.Name,
+			"label": nh.Node.Label,
 		}
 		if sig, ok := nh.Node.Properties["signature"]; ok {
 			info["signature"] = sig
@@ -231,11 +244,9 @@ func buildHopsWithRisk(visited []*store.NodeHop) []hopEntry {
 	hopMap := map[int][]map[string]any{}
 	for _, nh := range visited {
 		info := map[string]any{
-			"name":           nh.Node.Name,
-			"qualified_name": nh.Node.QualifiedName,
-			"label":          nh.Node.Label,
-			"risk":           string(store.HopToRisk(nh.Hop)),
-			"hop":            nh.Hop,
+			"name":  nh.Node.Name,
+			"label": nh.Node.Label,
+			"risk":  string(store.HopToRisk(nh.Hop)),
 		}
 		if sig, ok := nh.Node.Properties["signature"]; ok {
 			info["signature"] = sig
@@ -290,6 +301,37 @@ func (s *Server) findSimilarNodes(name, project string, limit int) []*store.Node
 	return nodes
 }
 
+// buildTraceSummary returns a compact summary with hop counts and edge type distribution,
+// without listing individual nodes or edges.
+func buildTraceSummary(st *store.Store, rootNode *store.Node, project string, visited []*store.NodeHop, edges []store.EdgeInfo) map[string]any {
+	// Count nodes per hop
+	hopCounts := map[int]int{}
+	for _, nh := range visited {
+		hopCounts[nh.Hop]++
+	}
+	hopSummary := make([]map[string]any, 0, len(hopCounts))
+	for h := 1; h <= len(hopCounts); h++ {
+		if count, ok := hopCounts[h]; ok {
+			hopSummary = append(hopSummary, map[string]any{"hop": h, "count": count})
+		}
+	}
+
+	// Count edges by type
+	edgeTypeCounts := map[string]int{}
+	for _, e := range edges {
+		edgeTypeCounts[e.Type]++
+	}
+
+	return map[string]any{
+		"root":         buildNodeInfo(rootNode),
+		"total_nodes":  len(visited),
+		"total_edges":  len(edges),
+		"hops":         hopSummary,
+		"edge_types":   edgeTypeCounts,
+		"summary_only": true,
+	}
+}
+
 func buildEdgeList(edges []store.EdgeInfo) []map[string]any {
 	result := make([]map[string]any, 0, len(edges))
 	for _, e := range edges {
@@ -300,6 +342,12 @@ func buildEdgeList(edges []store.EdgeInfo) []map[string]any {
 		}
 		if e.Confidence > 0 {
 			entry["confidence"] = e.Confidence
+		}
+		if e.ConfidenceBand != "" {
+			entry["confidence_band"] = e.ConfidenceBand
+		}
+		if e.ResolutionStrategy != "" {
+			entry["resolution_strategy"] = e.ResolutionStrategy
 		}
 		result = append(result, entry)
 	}

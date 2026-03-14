@@ -285,14 +285,17 @@ func TestSnippet_AmbiguousShortName(t *testing.T) {
 	if len(suggestions) < 2 {
 		t.Errorf("expected at least 2 suggestions, got %d", len(suggestions))
 	}
-	// Verify suggestions have qualified_name
+	// Verify suggestions have name and file
 	for _, s := range suggestions {
 		sMap, ok := s.(map[string]any)
 		if !ok {
 			t.Fatalf("expected suggestion map, got %T", s)
 		}
-		if sMap["qualified_name"] == nil || sMap["qualified_name"] == "" {
-			t.Error("suggestion missing qualified_name")
+		if sMap["name"] == nil || sMap["name"] == "" {
+			t.Error("suggestion missing name")
+		}
+		if sMap["file"] == nil || sMap["file"] == "" {
+			t.Error("suggestion missing file")
 		}
 	}
 }
@@ -429,8 +432,8 @@ func TestSnippet_AutoResolve_Enabled(t *testing.T) {
 		t.Errorf("expected 1 alternative, got %d", len(alternatives))
 	}
 	// The picked one should be cmd.server.Run (has 1 inbound CALLS edge = higher degree)
-	if data["qualified_name"] != "test-project.cmd.server.Run" {
-		t.Errorf("expected auto_resolve to pick server.Run (higher degree), got %v", data["qualified_name"])
+	if data["qn"] != "cmd.server.Run" {
+		t.Errorf("expected auto_resolve to pick server.Run (higher degree), got %v", data["qn"])
 	}
 }
 

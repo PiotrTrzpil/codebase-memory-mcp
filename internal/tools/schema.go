@@ -39,7 +39,7 @@ func (s *Server) handleGetGraphSchema(_ context.Context, req *mcp.CallToolReques
 
 	adr, _ := st.GetADR(projName)
 
-	return jsonResult(map[string]any{
+	return s.result(map[string]any{
 		"projects": []projectSchema{{Project: projName, Schema: schema, ADRPresent: adr != nil}},
 	}), nil
 }
