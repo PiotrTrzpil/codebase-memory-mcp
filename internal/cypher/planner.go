@@ -46,6 +46,14 @@ type FilterWhere struct {
 
 func (*FilterWhere) stepType() string { return "filter" }
 
+// UnwindStep expands JSON array properties into individual rows.
+type UnwindStep struct {
+	Expression Expr
+	Alias      string
+}
+
+func (*UnwindStep) stepType() string { return "unwind" }
+
 // asNodePattern safely type-asserts a PatternElement to *NodePattern.
 func asNodePattern(el PatternElement) (*NodePattern, error) {
 	np, ok := el.(*NodePattern)
@@ -138,6 +146,14 @@ func BuildPlan(q *Query) (*Plan, error) {
 			Conditions: q.Where.Conditions,
 			Operator:   q.Where.Operator,
 			Root:       q.Where.Root,
+		})
+	}
+
+	// UNWIND clause (JSON array expansion)
+	if q.Unwind != nil {
+		plan.Steps = append(plan.Steps, &UnwindStep{
+			Expression: q.Unwind.Expression,
+			Alias:      q.Unwind.Alias,
 		})
 	}
 

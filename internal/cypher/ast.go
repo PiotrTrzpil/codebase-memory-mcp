@@ -4,6 +4,7 @@ package cypher
 type Query struct {
 	Match  *MatchClause
 	Where  *WhereClause
+	Unwind *UnwindClause
 	Return *ReturnClause
 }
 
@@ -56,6 +57,13 @@ type ConditionGroup struct {
 	Conditions []Condition
 	Groups     []ConditionGroup
 	Operator   string // "AND" or "OR"
+}
+
+// UnwindClause unwinds a JSON array property into individual rows.
+// Syntax: UNWIND r.first_arg AS event
+type UnwindClause struct {
+	Expression Expr   // the expression to unwind (e.g., PropertyExpr for r.first_arg)
+	Alias      string // variable name for each element
 }
 
 // Condition is a single property comparison.

@@ -1,6 +1,7 @@
 package cypher
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -2213,5 +2214,100 @@ func TestFirstArgReturnValue(t *testing.T) {
 		if !strings.Contains(fa, want) {
 			t.Errorf("r.first_arg %q missing %q", fa, want)
 		}
+	}
+}
+
+// TestUnwindExpandsJsonArray verifies UNWIND expands a JSON array property into rows.
+func TestUnwindExpandsJsonArray(t *testing.T) {
+	s := setupFirstArgStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE a.name = 'dispatch' UNWIND r.first_arg AS event RETURN event`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("expected 3 rows (one per array element), got %d: %v", len(result.Rows), result.Rows)
+	}
+	got := make(map[string]bool)
+	for _, row := range result.Rows {
+		got[fmt.Sprintf("%v", row["event"])] = true
+	}
+	for _, want := range []string{"phase:start", "phase:end", "phase:cleanup"} {
+		if !got[want] {
+			t.Errorf("missing unwound element %q, got %v", want, got)
+		}
+	}
+}
+
+// TestUnwindSingleElement verifies UNWIND works with single-element arrays.
+func TestUnwindSingleElement(t *testing.T) {
+	s := setupFirstArgStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE a.name = 'setup' AND r.first_arg = 'task:ready' UNWIND r.first_arg AS event RETURN event, b.name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["event"] != "task:ready" {
+		t.Errorf("expected event 'task:ready', got %v", result.Rows[0]["event"])
+	}
+}
+
+// TestUnwindDistinct verifies UNWIND + DISTINCT deduplicates across rows.
+func TestUnwindDistinct(t *testing.T) {
+	s := setupFirstArgStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// Unwind all first_arg values across all edges, with DISTINCT
+	result, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE r.first_arg CONTAINS ':' UNWIND r.first_arg AS event RETURN DISTINCT event`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// dispatch has 3 events, setup has 1 = 4 distinct events
+	if len(result.Rows) != 4 {
+		t.Fatalf("expected 4 distinct events, got %d: %v", len(result.Rows), result.Rows)
+	}
+}
+
+// TestUnwindNoArray verifies UNWIND on a non-array value passes it through.
+func TestUnwindNoArray(t *testing.T) {
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+	idA, _ := s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "caller",
+		QualifiedName: "test.caller", FilePath: "a.ts",
+	})
+	idB, _ := s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "callee",
+		QualifiedName: "test.callee", FilePath: "b.ts",
+	})
+	mustInsertEdge(t, s, &store.Edge{
+		Project: "test", SourceID: idA, TargetID: idB, Type: "CALLS",
+		Properties: map[string]any{"first_arg": "plain_string"},
+	})
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) UNWIND r.first_arg AS val RETURN val`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row for non-array, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["val"] != "plain_string" {
+		t.Errorf("expected 'plain_string', got %v", result.Rows[0]["val"])
 	}
 }

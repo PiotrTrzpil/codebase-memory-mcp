@@ -84,14 +84,16 @@ type Result struct {
 
 // binding maps variable names to matched nodes and edges.
 type binding struct {
-	nodes map[string]*store.Node
-	edges map[string]*store.Edge
+	nodes   map[string]*store.Node
+	edges   map[string]*store.Edge
+	scalars map[string]any // UNWIND variables
 }
 
 func newBinding() binding {
 	return binding{
-		nodes: make(map[string]*store.Node),
-		edges: make(map[string]*store.Edge),
+		nodes:   make(map[string]*store.Node),
+		edges:   make(map[string]*store.Edge),
+		scalars: make(map[string]any),
 	}
 }
 
@@ -491,6 +493,8 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 				}
 			}
 			bindings, err = e.execFilter(s, bindings)
+		case *UnwindStep:
+			bindings = e.execUnwind(s, bindings)
 		default:
 			return nil, fmt.Errorf("unknown step type: %T", step)
 		}
@@ -1186,6 +1190,9 @@ func (e *Executor) evalExpr(b binding, expr Expr) (any, error) {
 		if edge, ok := b.edges[ex.Variable]; ok {
 			return resolveEdgeItemValue(edge, ""), nil
 		}
+		if val, ok := b.scalars[ex.Variable]; ok {
+			return val, nil
+		}
 		return nil, nil
 	case *PropertyExpr:
 		if node, ok := b.nodes[ex.Variable]; ok {
@@ -1193,6 +1200,9 @@ func (e *Executor) evalExpr(b binding, expr Expr) (any, error) {
 		}
 		if edge, ok := b.edges[ex.Variable]; ok {
 			return getEdgeProperty(edge, ex.Property), nil
+		}
+		if val, ok := b.scalars[ex.Variable]; ok {
+			return val, nil // scalars don't have properties, return the value
 		}
 		return nil, nil
 	case *ListExpr:
@@ -1656,6 +1666,9 @@ func resolveItemValue(b binding, item ReturnItem, exec *Executor) any {
 	if edge, ok := b.edges[item.Variable]; ok {
 		return resolveEdgeItemValue(edge, item.Property)
 	}
+	if val, ok := b.scalars[item.Variable]; ok {
+		return val
+	}
 	return nil
 }
 
@@ -1867,7 +1880,46 @@ func copyBinding(b binding) binding {
 	for k, v := range b.edges {
 		c.edges[k] = v
 	}
+	for k, v := range b.scalars {
+		c.scalars[k] = v
+	}
 	return c
+}
+
+// execUnwind expands bindings by unwinding a JSON array property into individual rows.
+func (e *Executor) execUnwind(step *UnwindStep, bindings []binding) []binding {
+	var result []binding
+	for _, b := range bindings {
+		val, err := e.evalExpr(b, step.Expression)
+		if err != nil || val == nil {
+			continue
+		}
+		str, ok := val.(string)
+		if !ok {
+			// Non-string value: keep as-is
+			nb := copyBinding(b)
+			nb.scalars[step.Alias] = val
+			result = append(result, nb)
+			continue
+		}
+		// Try to parse as JSON array
+		if len(str) >= 2 && str[0] == '[' {
+			var arr []string
+			if json.Unmarshal([]byte(str), &arr) == nil {
+				for _, elem := range arr {
+					nb := copyBinding(b)
+					nb.scalars[step.Alias] = elem
+					result = append(result, nb)
+				}
+				continue
+			}
+		}
+		// Not a JSON array: use as-is
+		nb := copyBinding(b)
+		nb.scalars[step.Alias] = str
+		result = append(result, nb)
+	}
+	return result
 }
 
 // filterNodesByProps filters nodes by inline property key-value pairs.

@@ -30,6 +30,7 @@ const (
 	TokDesc                      // DESC
 	TokEnds                      // ENDS
 	TokIn                        // IN
+	TokUnwind                    // UNWIND
 
 	// Symbols
 	TokLParen   // (
@@ -69,7 +70,7 @@ var tokenNames = map[TokenType]string{
 	TokDistinct: "DISTINCT", TokCount: "COUNT",
 	TokContains: "CONTAINS", TokStarts: "STARTS", TokWith: "WITH",
 	TokNot: "NOT", TokAsc: "ASC", TokDesc: "DESC",
-	TokEnds: "ENDS", TokIn: "IN",
+	TokEnds: "ENDS", TokIn: "IN", TokUnwind: "UNWIND",
 	TokLParen: "'('", TokRParen: "')'",
 	TokLBracket: "'['", TokRBracket: "']'",
 	TokDash: "'-'", TokGT: "'>'", TokLT: "'<'",
@@ -122,6 +123,7 @@ var keywords = map[string]TokenType{
 	"DESC":     TokDesc,
 	"ENDS":     TokEnds,
 	"IN":       TokIn,
+	"UNWIND":   TokUnwind,
 }
 
 // singleCharTokens maps single-character symbols to their token type.

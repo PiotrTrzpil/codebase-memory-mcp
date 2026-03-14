@@ -65,6 +65,15 @@ func (p *Parser) parseQuery() (*Query, error) {
 		q.Where = w
 	}
 
+	// UNWIND clause (optional)
+	if p.peek().Type == TokUnwind {
+		u, err := p.parseUnwind()
+		if err != nil {
+			return nil, err
+		}
+		q.Unwind = u
+	}
+
 	// RETURN clause (optional but common)
 	if p.peek().Type == TokReturn {
 		r, err := p.parseReturn()
@@ -364,6 +373,53 @@ func (p *Parser) parseWhere() (*WhereClause, error) {
 	w.Operator = root.Operator
 
 	return w, nil
+}
+
+func (p *Parser) parseUnwind() (*UnwindClause, error) {
+	p.advance() // consume UNWIND
+
+	// Parse expression (e.g., r.first_arg)
+	expr, err := p.parsePropertyExpr()
+	if err != nil {
+		return nil, fmt.Errorf("UNWIND expression: %w", err)
+	}
+
+	// Expect AS keyword
+	if p.peek().Type != TokAs {
+		return nil, fmt.Errorf("expected AS after UNWIND expression at pos %d, got %q", p.peek().Pos, p.peek().Value)
+	}
+	p.advance() // consume AS
+
+	// Parse alias identifier
+	if p.peek().Type != TokIdent {
+		return nil, fmt.Errorf("expected identifier after AS at pos %d, got %q", p.peek().Pos, p.peek().Value)
+	}
+	alias := p.advance()
+
+	return &UnwindClause{
+		Expression: expr,
+		Alias:      alias.Value,
+	}, nil
+}
+
+// parsePropertyExpr parses a variable.property expression (e.g., r.first_arg).
+func (p *Parser) parsePropertyExpr() (Expr, error) {
+	if p.peek().Type != TokIdent {
+		return nil, fmt.Errorf("expected identifier at pos %d, got %q", p.peek().Pos, p.peek().Value)
+	}
+	variable := p.advance()
+
+	if p.peek().Type != TokDot {
+		return &VariableExpr{Variable: variable.Value}, nil
+	}
+	p.advance() // consume dot
+
+	if p.peek().Type != TokIdent {
+		return nil, fmt.Errorf("expected property name after dot at pos %d, got %q", p.peek().Pos, p.peek().Value)
+	}
+	property := p.advance()
+
+	return &PropertyExpr{Variable: variable.Value, Property: property.Value}, nil
 }
 
 // parseOrExpr parses OR-separated AND-groups (OR has lower precedence).
