@@ -412,6 +412,8 @@ func (s *Server) registerTools() {
 	s.registerProjectTools()
 	s.registerTraceTools()
 	s.registerDetectChanges()
+	s.registerSemanticDiff()
+	s.registerPlanCommits()
 	s.registerArchitectureTools()
 	s.registerConfigTools()
 }
@@ -904,6 +906,46 @@ func yamlResult(data any) *mcp.CallToolResult {
 		Content: []mcp.Content{
 			&mcp.TextContent{Text: string(b)},
 		},
+	}
+}
+
+// diffParams holds the common parameters shared by detect_changes and semantic_diff.
+type diffParams struct {
+	Scope       pipeline.DiffScope
+	BaseBranch  string
+	ToRef       string
+	Depth       int
+	MaxImpact   int
+	SummaryOnly bool
+}
+
+// parseDiffParams extracts and clamps the common diff parameters from tool args.
+func parseDiffParams(args map[string]any) diffParams {
+	scopeStr := getStringArg(args, "scope")
+	if scopeStr == "" {
+		scopeStr = "all"
+	}
+
+	depth := getIntArg(args, "depth", 3)
+	if depth < 1 {
+		depth = 1
+	}
+	if depth > 5 {
+		depth = 5
+	}
+
+	maxImpact := getIntArg(args, "max_impact", 50)
+	if maxImpact < 1 {
+		maxImpact = 1
+	}
+
+	return diffParams{
+		Scope:       pipeline.DiffScope(scopeStr),
+		BaseBranch:  getStringArg(args, "base_branch"),
+		ToRef:       getStringArg(args, "to_ref"),
+		Depth:       depth,
+		MaxImpact:   maxImpact,
+		SummaryOnly: getBoolArg(args, "summary_only"),
 	}
 }
 

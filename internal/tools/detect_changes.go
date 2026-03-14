@@ -55,27 +55,7 @@ func (s *Server) handleDetectChanges(_ context.Context, req *mcp.CallToolRequest
 		return errResult(err.Error()), nil
 	}
 
-	scopeStr := getStringArg(args, "scope")
-	if scopeStr == "" {
-		scopeStr = "all"
-	}
-	scope := pipeline.DiffScope(scopeStr)
-
-	baseBranch := getStringArg(args, "base_branch")
-	depth := getIntArg(args, "depth", 3)
-	if depth < 1 {
-		depth = 1
-	}
-	if depth > 5 {
-		depth = 5
-	}
-
-	maxImpact := getIntArg(args, "max_impact", 50)
-	if maxImpact < 1 {
-		maxImpact = 1
-	}
-
-	summaryOnly := getBoolArg(args, "summary_only")
+	dp := parseDiffParams(args)
 
 	project := getStringArg(args, "project")
 	effectiveProject := s.resolveProjectName(project)
@@ -86,7 +66,7 @@ func (s *Server) handleDetectChanges(_ context.Context, req *mcp.CallToolRequest
 	}
 
 	// Parse changed files
-	changedFiles, err := pipeline.ParseGitDiffFiles(repoPath, scope, baseBranch)
+	changedFiles, err := pipeline.ParseGitDiffFiles(repoPath, dp.Scope, dp.BaseBranch, dp.ToRef)
 	if err != nil {
 		return errResult(fmt.Sprintf("git diff: %v", err)), nil
 	}
@@ -96,16 +76,16 @@ func (s *Server) handleDetectChanges(_ context.Context, req *mcp.CallToolRequest
 	}
 
 	// Parse hunks for line-level mapping
-	hunks, err := pipeline.ParseGitDiffHunks(repoPath, scope, baseBranch)
+	hunks, err := pipeline.ParseGitDiffHunks(repoPath, dp.Scope, dp.BaseBranch, dp.ToRef)
 	if err != nil {
 		slog.Warn("detect_changes.hunks.err", "err", err)
 	}
 
 	changedSymbols := mapChangesToSymbols(st, projName, changedFiles, hunks)
-	impactedSymbols, allEdges := traceImpact(st, changedSymbols, depth)
+	impactedSymbols, allEdges := traceImpact(st, changedSymbols, dp.Depth)
 	summary := buildDetectSummary(changedFiles, changedSymbols, impactedSymbols, allEdges)
 
-	if summaryOnly {
+	if dp.SummaryOnly {
 		responseData := map[string]any{"summary": summary}
 		s.addIndexStatus(responseData)
 		result := s.result(responseData)
@@ -115,10 +95,10 @@ func (s *Server) handleDetectChanges(_ context.Context, req *mcp.CallToolRequest
 
 	// Cap impacted symbols output (summary still reflects the full set)
 	displayImpacted := impactedSymbols
-	if len(displayImpacted) > maxImpact {
-		displayImpacted = displayImpacted[:maxImpact]
+	if len(displayImpacted) > dp.MaxImpact {
+		displayImpacted = displayImpacted[:dp.MaxImpact]
 		summary["truncated"] = true
-		summary["max_impact"] = maxImpact
+		summary["max_impact"] = dp.MaxImpact
 	}
 
 	responseData := map[string]any{
