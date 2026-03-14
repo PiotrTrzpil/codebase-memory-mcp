@@ -195,31 +195,25 @@ func buildFileList(files []pipeline.ChangedFile) []map[string]any {
 }
 
 func buildSymbolList(symbols []*store.Node) []map[string]any {
-	result := make([]map[string]any, len(symbols))
-	for i, n := range symbols {
-		result[i] = map[string]any{
+	return groupItemsByFile(symbols, func(n *store.Node) (string, map[string]any) {
+		return n.FilePath, map[string]any{
 			"name":  n.Name,
 			"label": n.Label,
-			"file":  n.FilePath,
 			"lines": fmt.Sprintf("%d-%d", n.StartLine, n.EndLine),
 		}
-	}
-	return result
+	})
 }
 
 func buildImpactList(impacted []impactedSymbol) []map[string]any {
-	result := make([]map[string]any, len(impacted))
-	for i, is := range impacted {
-		result[i] = map[string]any{
+	return groupItemsByFile(impacted, func(is impactedSymbol) (string, map[string]any) {
+		return is.Node.FilePath, map[string]any{
 			"name":       is.Node.Name,
 			"label":      is.Node.Label,
-			"file":       is.Node.FilePath,
 			"risk":       string(store.HopToRisk(is.Hop)),
 			"hop":        is.Hop,
 			"changed_by": is.ChangedBy,
 		}
-	}
-	return result
+	})
 }
 
 // impactedSymbol extends NodeHop with the symbol that caused the impact.

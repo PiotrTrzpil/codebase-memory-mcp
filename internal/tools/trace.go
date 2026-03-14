@@ -59,21 +59,40 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 		// Fuzzy fallback: search for similar names and return structured suggestions
 		suggestions := s.findSimilarNodes(funcName, effectiveProject, 5)
 		if len(suggestions) > 0 {
-			suggList := make([]map[string]string, len(suggestions))
-			for i, n := range suggestions {
-				suggList[i] = map[string]string{
-					"name":  n.Name,
-					"label": n.Label,
-					"file":  n.FilePath,
-				}
-			}
 			return s.result(map[string]any{
 				"status":      "not_found",
 				"message":     fmt.Sprintf("function not found: %s — use a name from the suggestions below", funcName),
-				"suggestions": suggList,
+				"suggestions": groupNodesByFile(suggestions),
 			}), nil
 		}
 		return errResult(fmt.Sprintf("function not found: %s", funcName)), nil
+	}
+
+	// Class/Interface nodes don't have CALLS edges — suggest methods instead
+	if rootNode.Label == "Class" || rootNode.Label == "Interface" {
+		stInner, stErr := s.router.ForProject(foundProject)
+		if stErr == nil {
+			edges, _ := stInner.FindEdgesBySourceAndType(rootNode.ID, "DEFINES_METHOD")
+			if len(edges) > 0 {
+				methodNames := make([]string, 0, len(edges))
+				for _, edge := range edges {
+					m, mErr := stInner.FindNodeByID(edge.TargetID)
+					if mErr == nil {
+						methodNames = append(methodNames, m.Name)
+					}
+				}
+				return s.result(map[string]any{
+					"status":  "class_node",
+					"message": fmt.Sprintf("%s is a %s — trace_call_path operates on functions/methods, not classes. Use one of its methods instead:", funcName, rootNode.Label),
+					"file":    rootNode.FilePath,
+					"methods": methodNames,
+				}), nil
+			}
+		}
+		return s.result(map[string]any{
+			"status":  "class_node",
+			"message": fmt.Sprintf("%s is a %s — trace_call_path operates on functions/methods, not classes. Try a method name like ClassName.methodName instead.", funcName, rootNode.Label),
+		}), nil
 	}
 
 	// Get the store for the found project

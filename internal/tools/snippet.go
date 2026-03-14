@@ -272,18 +272,10 @@ func (s *Server) resolveSnippetNode(input, projectFilter string) (*snippetMatch,
 
 // snippetSuggestions returns a structured suggestion response for ambiguous or not-found lookups.
 func (s *Server) snippetSuggestions(input string, nodes []*store.Node) *mcp.CallToolResult {
-	suggList := make([]map[string]string, 0, len(nodes))
-	for _, n := range nodes {
-		suggList = append(suggList, map[string]string{
-			"name":  n.Name,
-			"label": n.Label,
-			"file":  n.FilePath,
-		})
-	}
 	return s.result(map[string]any{
 		"status":      "ambiguous",
 		"message":     fmt.Sprintf("%d matches for %q — pass file:name to disambiguate (e.g. %s:%s)", len(nodes), input, nodes[0].FilePath, nodes[0].Name),
-		"suggestions": suggList,
+		"suggestions": groupNodesByFile(nodes),
 	})
 }
 

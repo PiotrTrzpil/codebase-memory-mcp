@@ -37,8 +37,17 @@ type SearchResult struct {
 
 // SearchOutput wraps search results with total count for pagination.
 type SearchOutput struct {
-	Results []*SearchResult
-	Total   int
+	Results     []*SearchResult
+	Total       int
+	Diagnostics *SearchDiagnostics // non-nil only for dead code queries (exclude_entry_points + max_degree=0)
+}
+
+// SearchDiagnostics provides visibility into why dead code detection may return few/no results.
+type SearchDiagnostics struct {
+	TotalCandidates    int `json:"total_candidates"`     // nodes matching degree filter (before entry point/usage exclusions)
+	ExcludedEntryPoint int `json:"excluded_entry_point"` // excluded because is_entry_point=true
+	ExcludedExported   int `json:"excluded_exported"`    // excluded because is_exported=true
+	ExcludedUsageEdge  int `json:"excluded_usage_edge"`  // excluded because inbound USAGE edge exists
 }
 
 // loadConnectedNames fetches up to 10 connected node names for display.
@@ -82,7 +91,7 @@ func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 		return nil, err
 	}
 
-	allResults, err := s.buildFilteredResults(nodes, params)
+	allResults, diag, err := s.buildFilteredResults(nodes, params)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +102,9 @@ func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 	}
 	sortSearchResults(allResults, sortBy, params.NamePattern)
 
-	return paginateResults(allResults, params.Offset, params.Limit), nil
+	output := paginateResults(allResults, params.Offset, params.Limit)
+	output.Diagnostics = diag
+	return output, nil
 }
 
 // buildSearchConditions builds SQL WHERE conditions and args from search params.
@@ -439,7 +450,7 @@ var moduleEdgeTypes = map[string]bool{
 
 // buildFilteredResults applies degree, direction, and entry-point filters to nodes,
 // counts degrees, and loads connected names for each qualifying result.
-func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*SearchResult, error) {
+func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*SearchResult, *SearchDiagnostics, error) {
 	// Batch count degrees for all nodes at once
 	nodeIDs := make([]int64, len(nodes))
 	for i, n := range nodes {
@@ -448,7 +459,7 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 
 	degrees, err := s.batchCountDegrees(nodeIDs, params.Relationship)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// For dead code detection, precompute which nodes have inbound USAGE edges
@@ -462,8 +473,14 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 	// node degrees as a fallback for File nodes that have degree 0.
 	if params.Label == "File" && params.Relationship != "" && moduleEdgeTypes[params.Relationship] {
 		if err := s.enrichFileDegreesFromModules(nodes, degrees, params); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+	}
+
+	// Track diagnostics for dead code queries
+	var diag *SearchDiagnostics
+	if params.ExcludeEntryPoints && params.MaxDegree == 0 {
+		diag = &SearchDiagnostics{}
 	}
 
 	results := make([]*SearchResult, 0, len(nodes))
@@ -491,7 +508,23 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 			continue
 		}
 
+		if diag != nil {
+			diag.TotalCandidates++
+		}
+
 		if params.ExcludeEntryPoints && isEntryPoint(n) {
+			if diag != nil {
+				if ep, ok := n.Properties["is_entry_point"]; ok {
+					if b, ok := ep.(bool); ok && b {
+						diag.ExcludedEntryPoint++
+					}
+				}
+				if exp, ok := n.Properties["is_exported"]; ok {
+					if b, ok := exp.(bool); ok && b {
+						diag.ExcludedExported++
+					}
+				}
+			}
 			continue
 		}
 
@@ -499,6 +532,9 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 		// also exclude nodes that have inbound USAGE edges (callback references, event registrations).
 		if params.ExcludeEntryPoints && params.MaxDegree == 0 && usageTargetIDs != nil {
 			if _, hasUsage := usageTargetIDs[n.ID]; hasUsage {
+				if diag != nil {
+					diag.ExcludedUsageEdge++
+				}
 				continue
 			}
 		}
@@ -508,7 +544,7 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 		}
 		results = append(results, sr)
 	}
-	return results, nil
+	return results, diag, nil
 }
 
 // enrichFileDegreesFromModules finds Module nodes that share the same file_path

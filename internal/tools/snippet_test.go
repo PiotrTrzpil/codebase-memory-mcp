@@ -282,21 +282,39 @@ func TestSnippet_AmbiguousShortName(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected suggestions array, got %T", data["suggestions"])
 	}
-	if len(suggestions) < 2 {
-		t.Errorf("expected at least 2 suggestions, got %d", len(suggestions))
-	}
-	// Verify suggestions have name and file
+	// Suggestions may be grouped by file (when multiple items share a file)
+	// or flat (when each item has a different file). Verify structure of each.
+	totalItems := 0
 	for _, s := range suggestions {
 		sMap, ok := s.(map[string]any)
 		if !ok {
 			t.Fatalf("expected suggestion map, got %T", s)
 		}
-		if sMap["name"] == nil || sMap["name"] == "" {
-			t.Error("suggestion missing name")
-		}
 		if sMap["file"] == nil || sMap["file"] == "" {
 			t.Error("suggestion missing file")
 		}
+		if items, ok := sMap["items"].([]any); ok {
+			// Grouped format: {file, items: [{name, label}, ...]}
+			totalItems += len(items)
+			for _, item := range items {
+				iMap, ok := item.(map[string]any)
+				if !ok {
+					t.Fatalf("expected item map, got %T", item)
+				}
+				if iMap["name"] == nil || iMap["name"] == "" {
+					t.Error("grouped item missing name")
+				}
+			}
+		} else {
+			// Flat format: {name, label, file}
+			totalItems++
+			if sMap["name"] == nil || sMap["name"] == "" {
+				t.Error("suggestion missing name")
+			}
+		}
+	}
+	if totalItems < 2 {
+		t.Errorf("expected at least 2 suggestion items, got %d", totalItems)
 	}
 }
 

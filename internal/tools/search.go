@@ -96,6 +96,9 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 		responseData["has_more"] = true
 		responseData["next_offset"] = params.Offset + params.Limit
 	}
+	if output.Diagnostics != nil {
+		responseData["diagnostics"] = output.Diagnostics
+	}
 	s.addIndexStatus(responseData)
 
 	result := s.result(responseData)

@@ -822,6 +822,56 @@ func stripQNPrefix(qn, projectName string) string {
 	return qn
 }
 
+// groupItemsByFile groups items by file path. The toItem function extracts
+// the file path and item map from each element. When every item is from a
+// different file, falls back to a flat list with "file" inlined per item.
+func groupItemsByFile[T any](items []T, toItem func(T) (filePath string, item map[string]any)) []map[string]any {
+	type fileGroup struct {
+		file  string
+		items []map[string]any
+	}
+	orderMap := map[string]int{}
+	var groups []fileGroup
+	for _, it := range items {
+		fp, m := toItem(it)
+		idx, ok := orderMap[fp]
+		if !ok {
+			idx = len(groups)
+			orderMap[fp] = idx
+			groups = append(groups, fileGroup{file: fp})
+		}
+		groups[idx].items = append(groups[idx].items, m)
+	}
+	// If every item is from a different file, flatten to a simple list
+	if len(groups) == len(items) {
+		flat := make([]map[string]any, len(items))
+		for i, it := range items {
+			fp, m := toItem(it)
+			m["file"] = fp
+			flat[i] = m
+		}
+		return flat
+	}
+	result := make([]map[string]any, len(groups))
+	for i, g := range groups {
+		result[i] = map[string]any{
+			"file":  g.file,
+			"items": g.items,
+		}
+	}
+	return result
+}
+
+// groupNodesByFile groups store.Node slices by file path.
+func groupNodesByFile(nodes []*store.Node) []map[string]any {
+	return groupItemsByFile(nodes, func(n *store.Node) (string, map[string]any) {
+		return n.FilePath, map[string]any{
+			"name":  n.Name,
+			"label": n.Label,
+		}
+	})
+}
+
 // result marshals data in the configured output format (json or yaml).
 func (s *Server) result(data any) *mcp.CallToolResult {
 	format, _ := s.outputFormat.Load().(string)
