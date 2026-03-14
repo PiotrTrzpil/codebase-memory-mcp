@@ -219,6 +219,79 @@ static char* extract_callee_name(CBMArena* a, TSNode node, const char* source, C
     return NULL;
 }
 
+// is_string_node returns true if the node type represents a string literal.
+static bool is_string_node(const char* kind) {
+    return strcmp(kind, "string") == 0 ||
+           strcmp(kind, "string_literal") == 0 ||
+           strcmp(kind, "template_string") == 0 ||
+           strcmp(kind, "interpreted_string_literal") == 0 ||
+           strcmp(kind, "raw_string_literal") == 0 ||
+           strcmp(kind, "string_content") == 0;
+}
+
+// strip_quotes returns the string content without surrounding quotes.
+// Modifies the buffer in-place and returns a pointer past the opening quote.
+static const char* strip_quotes(char* text) {
+    if (!text || !text[0]) return NULL;
+    size_t len = strlen(text);
+    if (len < 2) return text;
+    // Triple quotes (Python """...""" / '''...''')
+    if (len >= 6 && ((strncmp(text, "\"\"\"", 3) == 0) || (strncmp(text, "'''", 3) == 0))) {
+        text[len - 3] = '\0';
+        return text + 3;
+    }
+    // Single/double/backtick
+    if (text[0] == '`' || text[0] == '"' || text[0] == '\'') {
+        text[len - 1] = '\0';
+        return text + 1;
+    }
+    return text;
+}
+
+// find_first_string_in_args scans ALL named children of an arguments node
+// and returns the first string literal found (at any position).
+// This handles patterns like subscribe(bus, 'eventName', handler) where the
+// string is not the first argument.
+static const char* find_first_string_in_args(CBMArena* a, TSNode args_node, const char* source) {
+    uint32_t count = ts_node_child_count(args_node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_child(args_node, i);
+        if (!ts_node_is_named(child)) continue; // skip "(" "," ")"
+
+        const char* kind = ts_node_type(child);
+        if (is_string_node(kind)) {
+            char* text = cbm_node_text(a, child, source);
+            return strip_quotes(text);
+        }
+    }
+    return NULL;
+}
+
+// Extract the first string literal argument from a call node, or NULL.
+// Searches for the arguments container by field name ("arguments") and by
+// child node type ("arguments", "argument_list", etc.) across grammars.
+static const char* extract_first_string_arg(CBMArena* a, TSNode call_node, const char* source) {
+    // Strategy 1: Try "arguments" field name (JS/TS, Go, Ruby, etc.)
+    TSNode args = ts_node_child_by_field_name(call_node, "arguments", 9);
+    if (!ts_node_is_null(args)) {
+        return find_first_string_in_args(a, args, source);
+    }
+
+    // Strategy 2: Walk children to find arguments/argument_list by type
+    uint32_t cc = ts_node_child_count(call_node);
+    for (uint32_t i = 0; i < cc; i++) {
+        TSNode child = ts_node_child(call_node, i);
+        const char* kind = ts_node_type(child);
+        if (strcmp(kind, "arguments") == 0 ||
+            strcmp(kind, "argument_list") == 0 ||
+            strcmp(kind, "actual_parameters") == 0) {
+            return find_first_string_in_args(a, child, source);
+        }
+    }
+
+    return NULL;
+}
+
 // Walk AST for call nodes
 static void walk_calls(CBMExtractCtx* ctx, TSNode node, const CBMLangSpec* spec) {
     const char* kind = ts_node_type(node);
@@ -231,6 +304,7 @@ static void walk_calls(CBMExtractCtx* ctx, TSNode node, const CBMLangSpec* spec)
                 CBMCall call;
                 call.callee_name = callee;
                 call.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
+                call.first_arg = extract_first_string_arg(ctx->arena, node, ctx->source);
                 cbm_calls_push(&ctx->result->calls, ctx->arena, call);
             }
         }
@@ -266,6 +340,7 @@ static void extract_jsx_refs(CBMExtractCtx* ctx, TSNode node) {
     CBMCall call;
     call.callee_name = name;
     call.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
+    call.first_arg = NULL;
     cbm_calls_push(&ctx->result->calls, ctx->arena, call);
 }
 
@@ -289,6 +364,7 @@ void handle_calls(CBMExtractCtx* ctx, TSNode node, const CBMLangSpec* spec, Walk
             CBMCall call;
             call.callee_name = callee;
             call.enclosing_func_qn = state->enclosing_func_qn;
+            call.first_arg = extract_first_string_arg(ctx->arena, node, ctx->source);
             cbm_calls_push(&ctx->result->calls, ctx->arena, call);
         }
     }
@@ -304,6 +380,7 @@ void handle_calls(CBMExtractCtx* ctx, TSNode node, const CBMLangSpec* spec, Walk
                     CBMCall call;
                     call.callee_name = name;
                     call.enclosing_func_qn = state->enclosing_func_qn;
+                    call.first_arg = NULL;
                     cbm_calls_push(&ctx->result->calls, ctx->arena, call);
                 }
             }

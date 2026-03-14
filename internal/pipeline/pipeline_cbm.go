@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -220,9 +221,11 @@ func enrichModuleNodeCBM(moduleNode *store.Node, cbmResult *cbm.FileResult, _ *p
 }
 
 // inferTypesCBM builds a TypeMap from CBM TypeAssign data + registry resolution.
-// Replaces the 14 language-specific infer*Types() functions.
+// Also includes class field type annotations so that this.field.method() chains
+// can resolve through field types (e.g., this.eventBus.emit() → EventBus.emit()).
 func inferTypesCBM(
 	typeAssigns []cbm.TypeAssign,
+	definitions []cbm.Definition,
 	registry *FunctionRegistry,
 	moduleQN string,
 	importMap map[string]string,
@@ -239,11 +242,23 @@ func inferTypesCBM(
 		}
 	}
 
-	// Return type propagation is handled by CBM TypeAssigns which already
-	// detect constructor patterns. Additional return-type-based inference
-	// from the returnTypes map is still useful for non-constructor calls.
-	// This would require the call data which we have in CBM Calls.
-	// For now, constructor-based inference covers the primary use case.
+	// Add class field types: for fields with type annotations (e.g., eventBus: EventBus),
+	// map the field name to its resolved type QN. This enables resolution of
+	// this.field.method() chains via type dispatch.
+	for i := range definitions {
+		def := &definitions[i]
+		if def.Label != "Field" || def.ReturnType == "" || def.Name == "" {
+			continue
+		}
+		// Don't overwrite explicit type assignments
+		if _, exists := types[def.Name]; exists {
+			continue
+		}
+		classQN := resolveAsClass(def.ReturnType, registry, moduleQN, importMap)
+		if classQN != "" {
+			types[def.Name] = classQN
+		}
+	}
 
 	return types
 }
@@ -254,14 +269,15 @@ func (p *Pipeline) resolveFileCallsCBM(relPath string, ext *cachedExtraction) []
 	moduleQN := fqn.ModuleQN(p.ProjectName, relPath)
 	importMap := p.importMaps[moduleQN]
 
-	// Build type map from CBM type assignments
-	typeMap := inferTypesCBM(ext.Result.TypeAssigns, p.registry, moduleQN, importMap)
+	// Build type map from CBM type assignments + class field type annotations
+	typeMap := inferTypesCBM(ext.Result.TypeAssigns, ext.Result.Definitions, p.registry, moduleQN, importMap)
 
 	var edges []resolvedEdge
 
 	for _, call := range ext.Result.Calls {
 		calleeName := call.CalleeName
 		callerQN := call.EnclosingFuncQN
+		firstArg := call.FirstArg
 		if calleeName == "" {
 			continue
 		}
@@ -275,8 +291,29 @@ func (p *Pipeline) resolveFileCallsCBM(relPath string, ext *cachedExtraction) []
 			if classQN != "" {
 				candidate := classQN + "." + calleeName[5:]
 				if p.registry.Exists(candidate) {
-					edges = append(edges, resolvedEdge{CallerQN: callerQN, TargetQN: candidate, Type: "CALLS"})
+					edges = append(edges, resolvedEdge{CallerQN: callerQN, TargetQN: candidate, Type: "CALLS",
+						Properties: callEdgeProps(0.90, "high", "self_dispatch", firstArg)})
 					continue
+				}
+			}
+		}
+
+		// JS/TS this.method() and this.field.method() resolution
+		if strings.HasPrefix(calleeName, "this.") {
+			classQN := extractClassFromMethodQN(callerQN)
+			if classQN != "" {
+				remaining := calleeName[5:] // e.g. "emit" or "eventBus.emit"
+				// Direct method: this.method() → Class.method()
+				candidate := classQN + "." + remaining
+				if p.registry.Exists(candidate) {
+					edges = append(edges, resolvedEdge{CallerQN: callerQN, TargetQN: candidate, Type: "CALLS",
+						Properties: callEdgeProps(0.90, "high", "this_dispatch", firstArg)})
+					continue
+				}
+				// Chained access: this.field.method() → try type dispatch on field
+				if strings.Contains(remaining, ".") {
+					// Strip "this." and let normal type dispatch handle "field.method"
+					calleeName = remaining
 				}
 			}
 		}
@@ -289,11 +326,7 @@ func (p *Pipeline) resolveFileCallsCBM(relPath string, ext *cachedExtraction) []
 					CallerQN: callerQN,
 					TargetQN: fuzzyResult.QualifiedName,
 					Type:     "CALLS",
-					Properties: map[string]any{
-						"confidence":          fuzzyResult.Confidence,
-						"confidence_band":     confidenceBand(fuzzyResult.Confidence),
-						"resolution_strategy": fuzzyResult.Strategy,
-					},
+					Properties: callEdgeProps(fuzzyResult.Confidence, confidenceBand(fuzzyResult.Confidence), fuzzyResult.Strategy, firstArg),
 				})
 			}
 			continue
@@ -303,15 +336,26 @@ func (p *Pipeline) resolveFileCallsCBM(relPath string, ext *cachedExtraction) []
 			CallerQN: callerQN,
 			TargetQN: result.QualifiedName,
 			Type:     "CALLS",
-			Properties: map[string]any{
-				"confidence":          result.Confidence,
-				"confidence_band":     confidenceBand(result.Confidence),
-				"resolution_strategy": result.Strategy,
-			},
+			Properties: callEdgeProps(result.Confidence, confidenceBand(result.Confidence), result.Strategy, firstArg),
 		})
 	}
 
 	return edges
+}
+
+// callEdgeProps builds the properties map for a CALLS edge, including the
+// optional first_arg (first string literal argument at the call site).
+func callEdgeProps(confidence float64, band, strategy, firstArg string) map[string]any {
+	props := map[string]any{
+		"confidence":          confidence,
+		"confidence_band":     band,
+		"resolution_strategy": strategy,
+	}
+	if firstArg != "" {
+		data, _ := json.Marshal([]string{firstArg})
+		props["first_arg"] = string(data)
+	}
+	return props
 }
 
 // resolveFileUsagesCBM resolves usage references using pre-extracted CBM data.

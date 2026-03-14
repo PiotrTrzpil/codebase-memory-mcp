@@ -3,6 +3,7 @@ package cypher
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -440,13 +441,25 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 			// into a single SQL JOIN, avoiding N+1 queries.
 			if i+1 < len(steps) {
 				if expand, ok := steps[i+1].(*ExpandRelationship); ok && canFuseJoin(s, expand) {
-					bindings, err = e.execJoinScanExpand(project, s, expand)
+					// Check if step i+2 is a FilterWhere we can push into the JOIN SQL.
+					var joinFilter *FilterWhere
+					if i+2 < len(steps) {
+						if fw, ok := steps[i+2].(*FilterWhere); ok {
+							if fw.Root == nil || (fw.Root.Operator == "AND" && len(fw.Root.Groups) == 0) {
+								joinFilter = fw
+							}
+						}
+					}
+					bindings, err = e.execJoinScanExpand(project, s, expand, joinFilter)
 					if err != nil {
 						return nil, err
 					}
 					// Mark next step as consumed by incrementing i via a skip flag
 					// We'll handle this below.
 					steps[i+1] = &fusedExpandMarker{}
+					if joinFilter != nil {
+						steps[i+2] = &fusedFilterMarker{}
+					}
 					break
 				}
 			}
@@ -465,6 +478,8 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 		case *ExpandRelationship:
 			bindings, err = e.execExpand(s, bindings)
 		case *fusedExpandMarker:
+			continue // already handled by JOIN fusion
+		case *fusedFilterMarker:
 			continue // already handled by JOIN fusion
 		case *FilterWhere:
 			// Skip if this was already consumed by push-down (simple AND only)
@@ -500,6 +515,12 @@ type fusedExpandMarker struct{}
 
 func (*fusedExpandMarker) stepType() string { return "fused" }
 
+// fusedFilterMarker is a placeholder step marking a FilterWhere
+// that was already pushed into the fused JOIN SQL.
+type fusedFilterMarker struct{}
+
+func (*fusedFilterMarker) stepType() string { return "fused_filter" }
+
 // canFuseJoin returns true if a ScanNodes + ExpandRelationship pair can be
 // replaced by a single SQL JOIN. Requirements: fixed-length (1 hop), known
 // edge types, standard direction, no inline property filters on source.
@@ -520,8 +541,9 @@ func canFuseJoin(scan *ScanNodes, expand *ExpandRelationship) bool {
 }
 
 // execJoinScanExpand executes a fused ScanNodes→ExpandRelationship step using
-// a single SQL JOIN, avoiding N+1 queries.
-func (e *Executor) execJoinScanExpand(project string, scan *ScanNodes, expand *ExpandRelationship) ([]binding, error) {
+// a single SQL JOIN, avoiding N+1 queries. An optional FilterWhere can be
+// pushed down into the SQL to avoid fetching rows that will be discarded.
+func (e *Executor) execJoinScanExpand(project string, scan *ScanNodes, expand *ExpandRelationship, pushDown *FilterWhere) ([]binding, error) {
 	// Build type filter: type IN (?, ?, ...)
 	typePlaceholders := make([]string, len(expand.EdgeTypes))
 	args := make([]any, 0, len(expand.EdgeTypes)+2)
@@ -553,6 +575,24 @@ func (e *Executor) execJoinScanExpand(project string, scan *ScanNodes, expand *E
 		tgtLabelClause, args = buildLabelClause("tgt", expand.ToLabel, args)
 	}
 
+	// Push down WHERE conditions into the SQL JOIN where possible.
+	// Maps variable names to SQL table aliases.
+	varToAlias := map[string]string{}
+	if scan.Variable != "" {
+		varToAlias[scan.Variable] = "src"
+	}
+	if expand.ToVar != "" {
+		varToAlias[expand.ToVar] = "tgt"
+	}
+	if expand.RelVar != "" {
+		varToAlias[expand.RelVar] = "e"
+	}
+	var pushDownClause string
+	var unpushedConditions []Condition
+	if pushDown != nil {
+		pushDownClause, unpushedConditions, args = buildJoinPushDown(pushDown, varToAlias, args)
+	}
+
 	query := fmt.Sprintf(`
 		SELECT
 			src.id, src.project, src.label, src.name, src.qualified_name, src.file_path, src.start_line, src.end_line, src.properties,
@@ -561,9 +601,9 @@ func (e *Executor) execJoinScanExpand(project string, scan *ScanNodes, expand *E
 		FROM edges e
 		JOIN nodes src ON src.id = e.%s
 		JOIN nodes tgt ON tgt.id = e.%s
-		WHERE e.project = ? AND e.type IN (%s)%s%s
+		WHERE e.project = ? AND e.type IN (%s)%s%s%s
 		LIMIT ?`,
-		srcCol, tgtCol, typeFilter, srcLabelClause, tgtLabelClause)
+		srcCol, tgtCol, typeFilter, srcLabelClause, tgtLabelClause, pushDownClause)
 
 	args = append(args, maxResultRows*2)
 
@@ -606,6 +646,18 @@ func (e *Executor) execJoinScanExpand(project string, scan *ScanNodes, expand *E
 		if expand.RelVar != "" {
 			b.edges[expand.RelVar] = &edge
 		}
+
+		// Apply unpushed WHERE conditions in Go
+		if len(unpushedConditions) > 0 {
+			match, evalErr := e.evaluateConditions(b, unpushedConditions, "AND")
+			if evalErr != nil {
+				return nil, evalErr
+			}
+			if !match {
+				continue
+			}
+		}
+
 		bindings = append(bindings, b)
 	}
 	if err := rows.Err(); err != nil {
@@ -613,6 +665,54 @@ func (e *Executor) execJoinScanExpand(project string, scan *ScanNodes, expand *E
 	}
 
 	return bindings, nil
+}
+
+// buildJoinPushDown extracts simple WHERE conditions that can be pushed into
+// the fused JOIN SQL query. Returns the SQL clause, unpushed conditions, and
+// updated args slice.
+func buildJoinPushDown(fw *FilterWhere, varToAlias map[string]string, args []any) (string, []Condition, []any) {
+	var clause string
+	var unpushed []Condition
+
+	conditions := fw.Conditions
+	if fw.Root != nil {
+		conditions = fw.Root.Conditions
+	}
+
+	for _, c := range conditions {
+		if c.Negated || (c.LHS != nil && c.Variable == "") {
+			unpushed = append(unpushed, c)
+			continue
+		}
+		alias, ok := varToAlias[c.Variable]
+		if !ok {
+			unpushed = append(unpushed, c)
+			continue
+		}
+		col, canPush := sqlPushableColumns[c.Property]
+		if !canPush {
+			unpushed = append(unpushed, c)
+			continue
+		}
+		switch c.Operator {
+		case "=":
+			clause += fmt.Sprintf(" AND %s.%s=?", alias, col)
+			args = append(args, c.Value)
+		case "CONTAINS":
+			clause += fmt.Sprintf(" AND %s.%s LIKE ?", alias, col)
+			args = append(args, "%"+c.Value+"%")
+		case "STARTS WITH":
+			clause += fmt.Sprintf(" AND %s.%s LIKE ?", alias, col)
+			args = append(args, c.Value+"%")
+		case "ENDS WITH":
+			clause += fmt.Sprintf(" AND %s.%s LIKE ?", alias, col)
+			args = append(args, "%"+c.Value)
+		default:
+			unpushed = append(unpushed, c)
+		}
+	}
+
+	return clause, unpushed, args
 }
 
 // sqlPushableColumns are node properties that map directly to SQL columns.
@@ -1142,7 +1242,12 @@ func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
 		var result bool
 		switch c.Operator {
 		case "=":
-			result = fmt.Sprintf("%v", lhsVal) == fmt.Sprintf("%v", rhsVal)
+			lhsStr := fmt.Sprintf("%v", lhsVal)
+			rhsStr := fmt.Sprintf("%v", rhsVal)
+			result = lhsStr == rhsStr
+			if !result {
+				result = jsonArrayContains(lhsStr, rhsStr)
+			}
 		case "=~":
 			s, ok := lhsVal.(string)
 			if !ok {
@@ -1164,6 +1269,8 @@ func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
 			rs, rok := rhsVal.(string)
 			if !ok || !rok {
 				result = false
+			} else if jsonArrayAny(s, func(elem string) bool { return strings.Contains(elem, rs) }) {
+				result = true
 			} else {
 				result = strings.Contains(s, rs)
 			}
@@ -1172,6 +1279,8 @@ func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
 			rs, rok := rhsVal.(string)
 			if !ok || !rok {
 				result = false
+			} else if jsonArrayAny(s, func(elem string) bool { return strings.HasPrefix(elem, rs) }) {
+				result = true
 			} else {
 				result = strings.HasPrefix(s, rs)
 			}
@@ -1180,6 +1289,8 @@ func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
 			rs, rok := rhsVal.(string)
 			if !ok || !rok {
 				result = false
+			} else if jsonArrayAny(s, func(elem string) bool { return strings.HasSuffix(elem, rs) }) {
+				result = true
 			} else {
 				result = strings.HasSuffix(s, rs)
 			}
@@ -1240,7 +1351,12 @@ func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
 	var result bool
 	switch c.Operator {
 	case "=":
-		result = fmt.Sprintf("%v", actual) == c.Value
+		actualStr := fmt.Sprintf("%v", actual)
+		result = actualStr == c.Value
+		// For JSON array properties (e.g. first_arg), check array containment
+		if !result {
+			result = jsonArrayContains(actualStr, c.Value)
+		}
 	case "=~":
 		s, ok := actual.(string)
 		if !ok {
@@ -1256,6 +1372,8 @@ func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
 		s, ok := actual.(string)
 		if !ok {
 			result = false
+		} else if jsonArrayAny(s, func(elem string) bool { return strings.Contains(elem, c.Value) }) {
+			result = true
 		} else {
 			result = strings.Contains(s, c.Value)
 		}
@@ -1263,6 +1381,8 @@ func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
 		s, ok := actual.(string)
 		if !ok {
 			result = false
+		} else if jsonArrayAny(s, func(elem string) bool { return strings.HasPrefix(elem, c.Value) }) {
+			result = true
 		} else {
 			result = strings.HasPrefix(s, c.Value)
 		}
@@ -1270,6 +1390,8 @@ func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
 		s, ok := actual.(string)
 		if !ok {
 			result = false
+		} else if jsonArrayAny(s, func(elem string) bool { return strings.HasSuffix(elem, c.Value) }) {
+			result = true
 		} else {
 			result = strings.HasSuffix(s, c.Value)
 		}
@@ -1768,4 +1890,28 @@ func nodeMatchesProps(n *store.Node, props map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// jsonArrayContains checks if s is a JSON string array that contains val.
+// Returns false quickly if s doesn't look like a JSON array.
+func jsonArrayContains(s, val string) bool {
+	return jsonArrayAny(s, func(elem string) bool { return elem == val })
+}
+
+// jsonArrayAny returns true if s is a JSON string array and any element
+// satisfies the predicate. Returns false if s is not a JSON array.
+func jsonArrayAny(s string, pred func(string) bool) bool {
+	if len(s) < 2 || s[0] != '[' {
+		return false
+	}
+	var arr []string
+	if json.Unmarshal([]byte(s), &arr) != nil {
+		return false
+	}
+	for _, v := range arr {
+		if pred(v) {
+			return true
+		}
+	}
+	return false
 }

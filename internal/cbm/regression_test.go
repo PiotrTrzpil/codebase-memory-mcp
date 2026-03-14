@@ -1280,3 +1280,223 @@ end function;
 	}
 	assertHasName(t, fns, "Factorial")
 }
+
+// =====================================================================
+// First-arg string literal extraction tests
+// =====================================================================
+
+func TestFirstArg_TypeScript_Emit(t *testing.T) {
+	src := []byte(`
+class Dispatcher {
+  notify() {
+    this.eventBus.emit("task:created", { id: 1 });
+    this.eventBus.on("task:updated", (data) => {});
+    console.log("hello");
+    doSomething(42);
+  }
+}
+`)
+	r, err := ExtractFile(src, lang.TypeScript, "t", "dispatcher.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstArgs := map[string]string{}
+	for _, c := range r.Calls {
+		if c.FirstArg != "" {
+			firstArgs[c.CalleeName] = c.FirstArg
+		}
+	}
+
+	if firstArgs["this.eventBus.emit"] != "task:created" {
+		t.Errorf("emit first_arg: got %q, want %q", firstArgs["this.eventBus.emit"], "task:created")
+	}
+	if firstArgs["this.eventBus.on"] != "task:updated" {
+		t.Errorf("on first_arg: got %q, want %q", firstArgs["this.eventBus.on"], "task:updated")
+	}
+	if firstArgs["console.log"] != "hello" {
+		t.Errorf("console.log first_arg: got %q, want %q", firstArgs["console.log"], "hello")
+	}
+	// doSomething(42) — first arg is not a string, should have no first_arg
+	if _, ok := firstArgs["doSomething"]; ok {
+		t.Errorf("doSomething should have no first_arg, got %q", firstArgs["doSomething"])
+	}
+}
+
+func TestFirstArg_Python_Emit(t *testing.T) {
+	src := []byte(`
+def handler():
+    bus.emit("job:started", payload)
+    bus.on("job:finished")
+    logger.info("debug")
+    process(data)
+`)
+	r, err := ExtractFile(src, lang.Python, "t", "handler.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstArgs := map[string]string{}
+	for _, c := range r.Calls {
+		if c.FirstArg != "" {
+			firstArgs[c.CalleeName] = c.FirstArg
+		}
+	}
+
+	if firstArgs["bus.emit"] != "job:started" {
+		t.Errorf("bus.emit first_arg: got %q, want %q", firstArgs["bus.emit"], "job:started")
+	}
+	if firstArgs["bus.on"] != "job:finished" {
+		t.Errorf("bus.on first_arg: got %q, want %q", firstArgs["bus.on"], "job:finished")
+	}
+	if firstArgs["logger.info"] != "debug" {
+		t.Errorf("logger.info first_arg: got %q, want %q", firstArgs["logger.info"], "debug")
+	}
+	if _, ok := firstArgs["process"]; ok {
+		t.Errorf("process should have no first_arg, got %q", firstArgs["process"])
+	}
+}
+
+func TestFirstArg_Go(t *testing.T) {
+	src := []byte(`
+package main
+func main() {
+	ch.Publish("user.created", msg)
+	fmt.Println("hello world")
+	doWork(123)
+}
+`)
+	r, err := ExtractFile(src, lang.Go, "t", "main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstArgs := map[string]string{}
+	for _, c := range r.Calls {
+		if c.FirstArg != "" {
+			firstArgs[c.CalleeName] = c.FirstArg
+		}
+	}
+
+	if firstArgs["ch.Publish"] != "user.created" {
+		t.Errorf("ch.Publish first_arg: got %q, want %q", firstArgs["ch.Publish"], "user.created")
+	}
+	if firstArgs["fmt.Println"] != "hello world" {
+		t.Errorf("fmt.Println first_arg: got %q, want %q", firstArgs["fmt.Println"], "hello world")
+	}
+	if _, ok := firstArgs["doWork"]; ok {
+		t.Errorf("doWork should have no first_arg, got %q", firstArgs["doWork"])
+	}
+}
+
+func TestFirstArg_SingleQuote(t *testing.T) {
+	src := []byte(`
+function setup() {
+  emitter.on('click', handler);
+}
+`)
+	r, err := ExtractFile(src, lang.JavaScript, "t", "setup.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range r.Calls {
+		if c.CalleeName == "emitter.on" {
+			if c.FirstArg != "click" {
+				t.Errorf("emitter.on first_arg: got %q, want %q", c.FirstArg, "click")
+			}
+			return
+		}
+	}
+	t.Error("emitter.on call not found")
+}
+
+func TestFirstArg_NoArgs(t *testing.T) {
+	src := []byte(`
+function run() {
+  doSomething();
+  process(variable);
+  compute(1 + 2);
+}
+`)
+	r, err := ExtractFile(src, lang.JavaScript, "t", "run.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range r.Calls {
+		if c.FirstArg != "" {
+			t.Errorf("call %q should have no first_arg, got %q", c.CalleeName, c.FirstArg)
+		}
+	}
+}
+
+// TestFirstArg_SecondArgString verifies that string literals at non-first
+// argument positions are captured (e.g., subscribe(bus, 'eventName', handler)).
+func TestFirstArg_SecondArgString(t *testing.T) {
+	src := []byte(`
+function setup() {
+  subscribe(eventBus, 'task:assigned', handler);
+  register(ctx, "job:done", callback, options);
+  noStr(a, b, c);
+}
+`)
+	r, err := ExtractFile(src, lang.JavaScript, "t", "setup.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstArgs := map[string]string{}
+	for _, c := range r.Calls {
+		if c.FirstArg != "" {
+			firstArgs[c.CalleeName] = c.FirstArg
+		}
+	}
+
+	if firstArgs["subscribe"] != "task:assigned" {
+		t.Errorf("subscribe first_arg: got %q, want %q", firstArgs["subscribe"], "task:assigned")
+	}
+	if firstArgs["register"] != "job:done" {
+		t.Errorf("register first_arg: got %q, want %q", firstArgs["register"], "job:done")
+	}
+	if _, ok := firstArgs["noStr"]; ok {
+		t.Errorf("noStr should have no first_arg, got %q", firstArgs["noStr"])
+	}
+}
+
+// TestFirstArg_MultipleCallsSameTarget verifies that multiple calls to the
+// same function with different string arguments all have their first_arg captured
+// (the dedup merge happens in the pipeline, not in extraction).
+func TestFirstArg_MultipleCallsSameTarget(t *testing.T) {
+	src := []byte(`
+class Controller {
+  update() {
+    this.bus.emit("phase:start", {});
+    this.bus.emit("phase:end", {});
+    this.bus.emit("phase:cleanup", {});
+  }
+}
+`)
+	r, err := ExtractFile(src, lang.TypeScript, "t", "ctrl.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// At the extraction level, each call should have its own first_arg
+	var emitArgs []string
+	for _, c := range r.Calls {
+		if c.CalleeName == "this.bus.emit" {
+			emitArgs = append(emitArgs, c.FirstArg)
+		}
+	}
+
+	if len(emitArgs) != 3 {
+		t.Fatalf("expected 3 emit calls, got %d: %v", len(emitArgs), emitArgs)
+	}
+	expected := map[string]bool{"phase:start": true, "phase:end": true, "phase:cleanup": true}
+	for _, a := range emitArgs {
+		if !expected[a] {
+			t.Errorf("unexpected emit first_arg: %q", a)
+		}
+	}
+}

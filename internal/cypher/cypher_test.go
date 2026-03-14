@@ -1827,3 +1827,391 @@ func TestReturnMixedSimpleAndArithmetic(t *testing.T) {
 		t.Errorf("lines = %v (%T), want 25", row["lines"], row["lines"])
 	}
 }
+
+// --- Fused JOIN WHERE push-down tests ---
+
+// setupHighFanInStore creates a store with many CALLS edges to test that
+// WHERE conditions are correctly pushed into fused JOINs. Without push-down,
+// the SQL LIMIT would grab arbitrary edges and miss filtered targets.
+func setupHighFanInStore(t *testing.T) *store.Store {
+	t.Helper()
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatalf("open memory store: %v", err)
+	}
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+
+	// Create 1 target node: "emit" — the needle
+	idEmit, _ := s.UpsertNode(&store.Node{
+		Project: "test", Label: "Method", Name: "emit",
+		QualifiedName: "test.EventBus.emit", FilePath: "event-bus.ts",
+	})
+
+	// Create 50 callers of "emit"
+	emitCallerIDs := make([]int64, 50)
+	for i := 0; i < 50; i++ {
+		id, _ := s.UpsertNode(&store.Node{
+			Project: "test", Label: "Function", Name: "emitCaller" + itoa(i),
+			QualifiedName: "test.caller" + itoa(i) + ".emitCaller" + itoa(i),
+			FilePath: "caller" + itoa(i) + ".ts",
+		})
+		emitCallerIDs[i] = id
+	}
+
+	// Create 500 "noise" functions calling each other (not emit)
+	noiseIDs := make([]int64, 500)
+	for i := 0; i < 500; i++ {
+		id, _ := s.UpsertNode(&store.Node{
+			Project: "test", Label: "Function", Name: "noise" + itoa(i),
+			QualifiedName: "test.noise" + itoa(i), FilePath: "noise.ts",
+		})
+		noiseIDs[i] = id
+	}
+
+	// Create 500 noise CALLS edges (noise[i] -> noise[i+1])
+	for i := 0; i < 499; i++ {
+		mustInsertEdge(t, s, &store.Edge{
+			Project: "test", SourceID: noiseIDs[i], TargetID: noiseIDs[i+1], Type: "CALLS",
+		})
+	}
+
+	// Create 50 CALLS edges pointing to emit — these are the important ones
+	for _, callerID := range emitCallerIDs {
+		mustInsertEdge(t, s, &store.Edge{
+			Project: "test", SourceID: callerID, TargetID: idEmit, Type: "CALLS",
+		})
+	}
+
+	return s
+}
+
+func itoa(i int) string {
+	return strings.Repeat("", 0) + string(rune('0'+i/100)) + string(rune('0'+(i/10)%10)) + string(rune('0'+i%10))
+}
+
+// TestFusedJoinWherePushDown verifies that WHERE conditions on the target node
+// are pushed into the SQL JOIN, so queries like "who calls emit?" return all
+// 50 callers instead of being capped by the LIMIT on the raw edge scan.
+func TestFusedJoinWherePushDown(t *testing.T) {
+	s := setupHighFanInStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[:CALLS]->(b) WHERE b.name = "emit" RETURN a.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if len(result.Rows) != 50 {
+		t.Errorf("expected 50 callers of emit, got %d (WHERE not pushed into JOIN?)", len(result.Rows))
+	}
+
+	// Verify all results are actual emit callers
+	for _, row := range result.Rows {
+		name, ok := row["a.name"].(string)
+		if !ok {
+			t.Errorf("expected string name, got %T", row["a.name"])
+			continue
+		}
+		if !strings.HasPrefix(name, "emitCaller") {
+			t.Errorf("unexpected caller name: %s", name)
+		}
+	}
+}
+
+// TestFusedJoinWhereOnSource tests WHERE push-down on the source node variable.
+func TestFusedJoinWhereOnSource(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[:CALLS]->(b) WHERE a.name = "HandleOrder" RETURN b.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	// HandleOrder calls ValidateOrder and LogError
+	if len(result.Rows) != 2 {
+		t.Errorf("expected 2 callees of HandleOrder, got %d", len(result.Rows))
+	}
+
+	names := map[string]bool{}
+	for _, row := range result.Rows {
+		names[row["b.name"].(string)] = true
+	}
+	if !names["ValidateOrder"] {
+		t.Error("missing ValidateOrder")
+	}
+	if !names["LogError"] {
+		t.Error("missing LogError")
+	}
+}
+
+// TestFusedJoinWhereContains tests CONTAINS push-down in fused JOINs.
+func TestFusedJoinWhereContains(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[:CALLS]->(b) WHERE b.name CONTAINS "Order" RETURN a.name, b.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	// ValidateOrder and SubmitOrder contain "Order"
+	// HandleOrder -> ValidateOrder, ValidateOrder -> SubmitOrder
+	if len(result.Rows) < 2 {
+		t.Errorf("expected at least 2 rows with 'Order' targets, got %d", len(result.Rows))
+	}
+
+	for _, row := range result.Rows {
+		bName := row["b.name"].(string)
+		if !strings.Contains(bName, "Order") {
+			t.Errorf("target %q doesn't contain 'Order'", bName)
+		}
+	}
+}
+
+// TestFusedJoinWhereStartsWith tests STARTS WITH push-down in fused JOINs.
+func TestFusedJoinWhereStartsWith(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[:CALLS]->(b) WHERE b.name STARTS WITH "Validate" RETURN a.name, b.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if len(result.Rows) != 1 {
+		t.Errorf("expected 1 row (HandleOrder->ValidateOrder), got %d", len(result.Rows))
+	}
+	if len(result.Rows) > 0 {
+		if result.Rows[0]["b.name"] != "ValidateOrder" {
+			t.Errorf("expected ValidateOrder, got %v", result.Rows[0]["b.name"])
+		}
+	}
+}
+
+// TestFusedJoinNoWhereStillWorks ensures queries without WHERE still work
+// correctly with fused JOINs.
+func TestFusedJoinNoWhereStillWorks(t *testing.T) {
+	s := setupTestStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	// 3 CALLS edges in setupTestStore
+	if len(result.Rows) != 3 {
+		t.Errorf("expected 3 CALLS edges, got %d", len(result.Rows))
+	}
+}
+
+// TestFusedJoinWhereCountAggregation tests that push-down works correctly
+// with COUNT aggregation — the typical "who calls this?" query pattern.
+func TestFusedJoinWhereCountAggregation(t *testing.T) {
+	s := setupHighFanInStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[:CALLS]->(b) WHERE b.name = "emit" RETURN b.name, COUNT(a) AS callers`)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 aggregated row, got %d", len(result.Rows))
+	}
+
+	var callerCount int
+	switch v := result.Rows[0]["callers"].(type) {
+	case int:
+		callerCount = v
+	case float64:
+		callerCount = int(v)
+	default:
+		t.Fatalf("expected numeric callers, got %T: %v", result.Rows[0]["callers"], result.Rows[0]["callers"])
+	}
+	if callerCount != 50 {
+		t.Errorf("expected 50 callers, got %d (WHERE not pushed into JOIN?)", callerCount)
+	}
+}
+
+// --- JSON array first_arg tests ---
+
+func setupFirstArgStore(t *testing.T) *store.Store {
+	t.Helper()
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatalf("open memory store: %v", err)
+	}
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+
+	idDispatch, _ := s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "dispatch",
+		QualifiedName: "test.dispatch", FilePath: "app.ts",
+	})
+	idEmit, _ := s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "emit",
+		QualifiedName: "test.EventBus.emit", FilePath: "bus.ts",
+	})
+	idSetup, _ := s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "setup",
+		QualifiedName: "test.setup", FilePath: "app.ts",
+	})
+	idSubscribe, _ := s.UpsertNode(&store.Node{
+		Project: "test", Label: "Function", Name: "subscribe",
+		QualifiedName: "test.EventBus.subscribe", FilePath: "bus.ts",
+	})
+
+	// dispatch -> emit with multiple first_arg values (JSON array)
+	mustInsertEdge(t, s, &store.Edge{
+		Project: "test", SourceID: idDispatch, TargetID: idEmit, Type: "CALLS",
+		Properties: map[string]any{"first_arg": `["phase:start","phase:end","phase:cleanup"]`},
+	})
+	// setup -> subscribe with single first_arg (still JSON array)
+	mustInsertEdge(t, s, &store.Edge{
+		Project: "test", SourceID: idSetup, TargetID: idSubscribe, Type: "CALLS",
+		Properties: map[string]any{"first_arg": `["task:ready"]`},
+	})
+	// setup -> emit with no first_arg
+	mustInsertEdge(t, s, &store.Edge{
+		Project: "test", SourceID: idSetup, TargetID: idEmit, Type: "CALLS",
+	})
+
+	return s
+}
+
+// TestFirstArgEqualsMatchesArrayElement verifies that r.first_arg = 'value'
+// matches when the stored value is a JSON array containing that element.
+func TestFirstArgEqualsMatchesArrayElement(t *testing.T) {
+	s := setupFirstArgStore(t)
+	defer s.Close()
+
+	// Should find dispatch -> emit via array containment
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE r.first_arg = 'phase:start' RETURN a.name, b.name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["a.name"] != "dispatch" {
+		t.Errorf("expected caller 'dispatch', got %v", result.Rows[0]["a.name"])
+	}
+}
+
+// TestFirstArgEqualsMiddleElement checks matching an element that's not first in the array.
+func TestFirstArgEqualsMiddleElement(t *testing.T) {
+	s := setupFirstArgStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE r.first_arg = 'phase:end' RETURN a.name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row for phase:end, got %d", len(result.Rows))
+	}
+}
+
+// TestFirstArgEqualsSingleElementArray checks matching against a single-element array.
+func TestFirstArgEqualsSingleElementArray(t *testing.T) {
+	s := setupFirstArgStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE r.first_arg = 'task:ready' RETURN a.name, b.name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row for task:ready, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["a.name"] != "setup" {
+		t.Errorf("expected 'setup', got %v", result.Rows[0]["a.name"])
+	}
+}
+
+// TestFirstArgEqualsNoMatch checks that non-existent values don't match.
+func TestFirstArgEqualsNoMatch(t *testing.T) {
+	s := setupFirstArgStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE r.first_arg = 'nonexistent' RETURN a.name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 0 {
+		t.Errorf("expected 0 rows for nonexistent, got %d", len(result.Rows))
+	}
+}
+
+// TestFirstArgContainsOnArray checks that CONTAINS matches per-element,
+// not as a raw substring of the serialized JSON.
+func TestFirstArgContainsOnArray(t *testing.T) {
+	s := setupFirstArgStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+
+	// "phase" appears in 3 elements of dispatch's edge — should match 1 edge
+	result, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE r.first_arg CONTAINS 'phase' RETURN a.name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row for CONTAINS 'phase', got %d", len(result.Rows))
+	}
+
+	// "start" matches "phase:start" but not "task:ready" — only dispatch edge
+	result2, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE r.first_arg CONTAINS 'start' RETURN a.name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result2.Rows) != 1 {
+		t.Fatalf("expected 1 row for CONTAINS 'start', got %d", len(result2.Rows))
+	}
+
+	// Substring that spans element boundaries in raw JSON should NOT match.
+	// e.g. "cleanup\",\"task" would match raw substring but no single element.
+	result3, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE r.first_arg CONTAINS 'cleanup","task' RETURN a.name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result3.Rows) != 0 {
+		t.Errorf("expected 0 rows for cross-element substring, got %d", len(result3.Rows))
+	}
+}
+
+// TestFirstArgReturnValue checks that r.first_arg returns the full JSON array.
+func TestFirstArgReturnValue(t *testing.T) {
+	s := setupFirstArgStore(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:CALLS]->(b) WHERE a.name = 'dispatch' RETURN r.first_arg`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	fa, _ := result.Rows[0]["r.first_arg"].(string)
+	for _, want := range []string{"phase:start", "phase:end", "phase:cleanup"} {
+		if !strings.Contains(fa, want) {
+			t.Errorf("r.first_arg %q missing %q", fa, want)
+		}
+	}
+}

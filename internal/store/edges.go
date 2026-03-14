@@ -8,12 +8,16 @@ import (
 )
 
 // InsertEdge inserts an edge (dedup by source_id, target_id, type).
+// For "first_arg", merges values into a JSON array to preserve multiple
+// string arguments from different call sites to the same target.
 func (s *Store) InsertEdge(e *Edge) (int64, error) {
+	props := marshalProps(e.Properties)
 	res, err := s.q.Exec(`
 		INSERT INTO edges (project, source_id, target_id, type, properties)
 		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(source_id, target_id, type) DO UPDATE SET properties=json_patch(properties, excluded.properties)`,
-		e.Project, e.SourceID, e.TargetID, e.Type, marshalProps(e.Properties))
+		ON CONFLICT(source_id, target_id, type) DO UPDATE SET
+			properties = json_patch(properties, excluded.properties)`,
+		e.Project, e.SourceID, e.TargetID, e.Type, props)
 	if err != nil {
 		return 0, fmt.Errorf("insert edge: %w", err)
 	}

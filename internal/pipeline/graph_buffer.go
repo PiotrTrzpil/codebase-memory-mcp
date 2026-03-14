@@ -154,7 +154,7 @@ func (b *GraphBuffer) InsertEdge(e *store.Edge) int64 {
 				existing.Properties = make(map[string]any)
 			}
 			for k, v := range e.Properties {
-				existing.Properties[k] = v
+				mergeEdgeProperty(existing.Properties, k, v)
 			}
 		}
 		return existing.ID
@@ -281,4 +281,43 @@ func (b *GraphBuffer) allNodes() []*store.Node {
 		nodes = append(nodes, n)
 	}
 	return nodes
+}
+
+// mergeEdgeProperty merges a property value into an existing property map.
+// For "first_arg", merges JSON arrays of distinct values so that multiple
+// calls to the same target with different string arguments are all preserved.
+func mergeEdgeProperty(props map[string]any, key string, val any) {
+	if key != "first_arg" {
+		props[key] = val
+		return
+	}
+	newStr, _ := val.(string)
+	if newStr == "" {
+		return
+	}
+	existing, exists := props[key]
+	if !exists {
+		props[key] = newStr
+		return
+	}
+	existStr, _ := existing.(string)
+	if existStr == "" {
+		props[key] = newStr
+		return
+	}
+	// Both are JSON arrays — parse, merge, deduplicate
+	var existVals, newVals []string
+	_ = json.Unmarshal([]byte(existStr), &existVals)
+	_ = json.Unmarshal([]byte(newStr), &newVals)
+	seen := make(map[string]bool, len(existVals))
+	for _, v := range existVals {
+		seen[v] = true
+	}
+	for _, v := range newVals {
+		if !seen[v] {
+			existVals = append(existVals, v)
+		}
+	}
+	data, _ := json.Marshal(existVals)
+	props[key] = string(data)
 }

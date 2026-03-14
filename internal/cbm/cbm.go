@@ -68,6 +68,7 @@ type Definition struct {
 type Call struct {
 	CalleeName      string
 	EnclosingFuncQN string
+	FirstArg        string // first string literal argument, empty if not a string
 }
 
 // Import represents a local name -> module path mapping.
@@ -298,6 +299,7 @@ func convertResult(r *C.CBMFileResult) *FileResult {
 			fr.Calls[i] = Call{
 				CalleeName:      C.GoString(c.callee_name),
 				EnclosingFuncQN: C.GoString(c.enclosing_func_qn),
+				FirstArg:        C.GoString(c.first_arg),
 			}
 		}
 	}

@@ -373,6 +373,10 @@ func (p *Pipeline) runSemanticEdgePasses() {
 	slog.Info("pass.timing", "pass", "usestype", "elapsed", time.Since(t))
 
 	t = time.Now()
+	p.passParamTypeEdges()
+	slog.Info("pass.timing", "pass", "paramtype_edges", "elapsed", time.Since(t))
+
+	t = time.Now()
 	p.passThrows()
 	slog.Info("pass.timing", "pass", "throws", "elapsed", time.Since(t))
 
@@ -480,6 +484,7 @@ func (p *Pipeline) runIncrementalPasses(
 
 	// AST-dependent passes (run on cached files before cleanup)
 	p.passUsesType()
+	p.passParamTypeEdges()
 	p.passThrows()
 	p.passReadsWrites()
 	p.passConfigures()

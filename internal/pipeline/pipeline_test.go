@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/discover"
@@ -927,4 +928,172 @@ func TestCleanBaseClassNames_ExtendsWithSpaces(t *testing.T) {
 	if names[0] != "Base" || names[1] != "Mixin" {
 		t.Errorf("expected [Base, Mixin], got %v", names)
 	}
+}
+
+func TestPipelineFirstArgOnEdge(t *testing.T) {
+	dir, err := os.MkdirTemp("", "cgm-firstarg-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	writeFile(t, filepath.Join(dir, "main.go"), `package main
+
+func main() {
+	Publish("user.created", data)
+	Subscribe("user.deleted")
+	Process(42)
+}
+
+func Publish(topic string, data interface{}) {}
+func Subscribe(topic string) {}
+func Process(n int) {}
+`)
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(context.Background(), s, dir, discover.ModeFull)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Find all CALLS edges from main
+	mainNodes, _ := s.FindNodesByName(p.ProjectName, "main")
+	if len(mainNodes) == 0 {
+		t.Fatal("main function not found")
+	}
+
+	edges, _ := s.FindEdgesBySourceAndType(mainNodes[0].ID, "CALLS")
+	t.Logf("CALLS edges from main: %d", len(edges))
+
+	firstArgs := map[string]string{}
+	for _, e := range edges {
+		// Resolve target name
+		tgt, _ := s.FindNodeByID(e.TargetID)
+		if tgt != nil {
+			fa, _ := e.Properties["first_arg"].(string)
+			t.Logf("  %s -> %s first_arg=%q props=%v", mainNodes[0].Name, tgt.Name, fa, e.Properties)
+			if fa != "" {
+				firstArgs[tgt.Name] = fa
+			}
+		}
+	}
+
+	if firstArgs["Publish"] != `["user.created"]` {
+		t.Errorf("Publish first_arg: got %q, want %q", firstArgs["Publish"], `["user.created"]`)
+	}
+	if firstArgs["Subscribe"] != `["user.deleted"]` {
+		t.Errorf("Subscribe first_arg: got %q, want %q", firstArgs["Subscribe"], `["user.deleted"]`)
+	}
+	if _, ok := firstArgs["Process"]; ok {
+		t.Errorf("Process should have no first_arg, got %q", firstArgs["Process"])
+	}
+}
+
+func TestPipelineFirstArgDedup(t *testing.T) {
+	dir, err := os.MkdirTemp("", "cgm-firstarg-dedup-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Dispatch calls the same target (Emit) multiple times with different string args.
+	writeFile(t, filepath.Join(dir, "main.go"), `package main
+
+func Dispatch() {
+	Emit("phase:start")
+	Emit("phase:end")
+	Emit("phase:cleanup")
+}
+
+func Emit(event string) {}
+`)
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(context.Background(), s, dir, discover.ModeFull)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Find the CALLS edge from Dispatch -> Emit
+	dispatchNodes, _ := s.FindNodesByName(p.ProjectName, "Dispatch")
+	if len(dispatchNodes) == 0 {
+		t.Fatal("Dispatch function not found")
+	}
+
+	edges, _ := s.FindEdgesBySourceAndType(dispatchNodes[0].ID, "CALLS")
+	for _, e := range edges {
+		tgt, _ := s.FindNodeByID(e.TargetID)
+		if tgt != nil && tgt.Name == "Emit" {
+			fa, _ := e.Properties["first_arg"].(string)
+			t.Logf("Dispatch->Emit first_arg=%q", fa)
+			// Should be a JSON array with all 3 values
+			if fa == "" {
+				t.Error("first_arg is empty, expected merged values")
+			}
+			// Must contain all three event names
+			for _, want := range []string{"phase:start", "phase:end", "phase:cleanup"} {
+				if !strings.Contains(fa, want) {
+					t.Errorf("first_arg %q missing %q", fa, want)
+				}
+			}
+			return
+		}
+	}
+	t.Error("Dispatch->Emit edge not found")
+}
+
+func TestPipelineFirstArgSecondPosition(t *testing.T) {
+	dir, err := os.MkdirTemp("", "cgm-firstarg-pos-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	writeFile(t, filepath.Join(dir, "main.go"), `package main
+
+func Setup() {
+	Register(ctx, "event:ready")
+}
+
+func Register(bus interface{}, name string) {}
+`)
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(context.Background(), s, dir, discover.ModeFull)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	setupNodes, _ := s.FindNodesByName(p.ProjectName, "Setup")
+	if len(setupNodes) == 0 {
+		t.Fatal("Setup function not found")
+	}
+
+	edges, _ := s.FindEdgesBySourceAndType(setupNodes[0].ID, "CALLS")
+	for _, e := range edges {
+		tgt, _ := s.FindNodeByID(e.TargetID)
+		if tgt != nil && tgt.Name == "Register" {
+			fa, _ := e.Properties["first_arg"].(string)
+			if fa != `["event:ready"]` {
+				t.Errorf("Register first_arg: got %q, want %q", fa, `["event:ready"]`)
+			}
+			return
+		}
+	}
+	t.Error("Setup->Register edge not found")
 }
