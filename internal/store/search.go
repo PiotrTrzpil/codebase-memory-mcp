@@ -272,17 +272,24 @@ func globToLike(pattern string) string {
 	return result
 }
 
-// isEntryPoint returns true if a node has is_entry_point=true in its properties.
+// isEntryPoint returns true if a node has is_entry_point=true or is_exported=true
+// in its properties. Exported functions are part of the module's public API and
+// should not be considered dead code even if no in-project callers exist.
 func isEntryPoint(n *Node) bool {
 	if n.Properties == nil {
 		return false
 	}
-	ep, ok := n.Properties["is_entry_point"]
-	if !ok {
-		return false
+	if ep, ok := n.Properties["is_entry_point"]; ok {
+		if b, ok := ep.(bool); ok && b {
+			return true
+		}
 	}
-	b, ok := ep.(bool)
-	return ok && b
+	if exp, ok := n.Properties["is_exported"]; ok {
+		if b, ok := exp.(bool); ok && b {
+			return true
+		}
+	}
+	return false
 }
 
 // degreePair stores in-degree and out-degree for a node.
@@ -375,6 +382,46 @@ func (s *Store) scanDegrees(query string, args []any, result map[int64]degreePai
 	return rows.Err()
 }
 
+// batchHasInboundEdges returns a set of node IDs that have at least one inbound edge of the given type.
+func (s *Store) batchHasInboundEdges(nodeIDs []int64, edgeType string) map[int64]struct{} {
+	result := make(map[int64]struct{})
+	const maxPerQuery = 998
+
+	for i := 0; i < len(nodeIDs); i += maxPerQuery {
+		end := i + maxPerQuery
+		if end > len(nodeIDs) {
+			end = len(nodeIDs)
+		}
+		chunk := nodeIDs[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		for j, id := range chunk {
+			placeholders[j] = "?"
+			args = append(args, id)
+		}
+		args = append(args, edgeType)
+
+		query := fmt.Sprintf(
+			"SELECT DISTINCT target_id FROM edges WHERE target_id IN (%s) AND type = ?",
+			strings.Join(placeholders, ","),
+		)
+		rows, err := s.q.Query(query, args...)
+		if err != nil {
+			continue
+		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				break
+			}
+			result[id] = struct{}{}
+		}
+		rows.Close()
+	}
+	return result
+}
+
 // moduleEdgeTypes are edge types that exist on Module nodes, not File nodes.
 // When searching for File nodes with these relationship types, we fall back to
 // the corresponding Module node's degree.
@@ -402,6 +449,13 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 	degrees, err := s.batchCountDegrees(nodeIDs, params.Relationship)
 	if err != nil {
 		return nil, err
+	}
+
+	// For dead code detection, precompute which nodes have inbound USAGE edges
+	// so we can exclude callback references and event registrations.
+	var usageTargetIDs map[int64]struct{}
+	if params.ExcludeEntryPoints && params.MaxDegree == 0 && params.Relationship != "USAGE" {
+		usageTargetIDs = s.batchHasInboundEdges(nodeIDs, "USAGE")
 	}
 
 	// When searching File nodes with a Module-level edge type, look up Module
@@ -439,6 +493,14 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 
 		if params.ExcludeEntryPoints && isEntryPoint(n) {
 			continue
+		}
+
+		// When doing dead code detection (exclude_entry_points + max_degree=0 on CALLS),
+		// also exclude nodes that have inbound USAGE edges (callback references, event registrations).
+		if params.ExcludeEntryPoints && params.MaxDegree == 0 && usageTargetIDs != nil {
+			if _, hasUsage := usageTargetIDs[n.ID]; hasUsage {
+				continue
+			}
 		}
 
 		if params.IncludeConnected {

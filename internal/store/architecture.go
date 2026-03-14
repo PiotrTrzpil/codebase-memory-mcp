@@ -96,6 +96,16 @@ type FileTreeEntry struct {
 	Children int    `json:"children"`
 }
 
+// ArchOptions carries optional parameters for architecture queries.
+type ArchOptions struct {
+	// BoundaryPathPrefix filters boundaries to nodes whose file_path starts with this prefix.
+	// When set, uses sub-directory segmentation within the prefix instead of QN-based packages.
+	BoundaryPathPrefix string
+	// BoundaryDepth controls how many directory levels deep to segment boundaries (default: 0 = use QN).
+	// Depth 1 = top-level dirs, 2 = two levels, etc.
+	BoundaryDepth int
+}
+
 // buildAspectSet converts the aspects slice into a lookup set.
 // An empty list or a list containing "all" means every aspect is wanted.
 func buildAspectSet(aspects []string) map[string]bool {
@@ -115,7 +125,7 @@ func buildAspectSet(aspects []string) map[string]bool {
 }
 
 // fetchAspects dispatches each requested aspect to its query method.
-func (s *Store) fetchAspects(project string, info *ArchitectureInfo, want map[string]bool) error {
+func (s *Store) fetchAspects(project string, info *ArchitectureInfo, want map[string]bool, opts ArchOptions) error {
 	type aspectEntry struct {
 		name string
 		fn   func() error
@@ -126,7 +136,7 @@ func (s *Store) fetchAspects(project string, info *ArchitectureInfo, want map[st
 		{"entry_points", func() error { var e error; info.EntryPoints, e = s.archEntryPoints(project); return e }},
 		{"routes", func() error { var e error; info.Routes, e = s.archRoutes(project); return e }},
 		{"hotspots", func() error { var e error; info.Hotspots, e = s.archHotspots(project); return e }},
-		{"boundaries", func() error { var e error; info.Boundaries, e = s.archBoundaries(project); return e }},
+		{"boundaries", func() error { var e error; info.Boundaries, e = s.archBoundaries(project, opts); return e }},
 		{"services", func() error { var e error; info.Services, e = s.archServices(project); return e }},
 		{"layers", func() error { var e error; info.Layers, e = s.archLayers(project); return e }},
 		{"clusters", func() error { var e error; info.Clusters, e = s.archClusters(project); return e }},
@@ -145,10 +155,14 @@ func (s *Store) fetchAspects(project string, info *ArchitectureInfo, want map[st
 
 // GetArchitecture computes architecture aspects for a project.
 // When aspects contains "all" or is empty, all aspects are computed.
-func (s *Store) GetArchitecture(project string, aspects []string) (*ArchitectureInfo, error) {
+func (s *Store) GetArchitecture(project string, aspects []string, opts ...ArchOptions) (*ArchitectureInfo, error) {
 	want := buildAspectSet(aspects)
+	var opt ArchOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	info := &ArchitectureInfo{}
-	if err := s.fetchAspects(project, info, want); err != nil {
+	if err := s.fetchAspects(project, info, want, opt); err != nil {
 		return nil, err
 	}
 	return info, nil
@@ -371,22 +385,42 @@ func (s *Store) archHotspots(project string) ([]HotspotFunction, error) {
 	return result, rows.Err()
 }
 
-func (s *Store) archBoundaries(project string) ([]CrossPkgBoundary, error) {
-	// Build node ID → package name map via QN prefix (only callable nodes)
-	nodeRows, err := s.q.Query(`SELECT id, qualified_name FROM nodes WHERE project=? AND label IN ('Function','Method','Class')`, project)
+func (s *Store) archBoundaries(project string, opts ArchOptions) ([]CrossPkgBoundary, error) {
+	useFilePath := opts.BoundaryDepth > 0 || opts.BoundaryPathPrefix != ""
+
+	// Build node ID → package name map via QN prefix (or file path segments)
+	nodeRows, err := s.q.Query(`SELECT id, qualified_name, file_path FROM nodes WHERE project=? AND label IN ('Function','Method','Class')`, project)
 	if err != nil {
 		return nil, err
 	}
 	defer nodeRows.Close()
 
+	depth := opts.BoundaryDepth
+	if depth <= 0 {
+		depth = 1 // default: one level below prefix (or top-level if no prefix)
+	}
+	// When a path prefix is set, depth is relative to the prefix.
+	// e.g., prefix "src/game/features/" (3 parts) + depth 1 = absolute depth 4
+	if opts.BoundaryPathPrefix != "" {
+		prefixDepth := len(strings.Split(strings.TrimRight(opts.BoundaryPathPrefix, "/"), "/"))
+		depth += prefixDepth
+	}
+
 	nodePkg := map[int64]string{}
 	for nodeRows.Next() {
 		var id int64
-		var qn string
-		if err := nodeRows.Scan(&id, &qn); err != nil {
+		var qn, fp string
+		if err := nodeRows.Scan(&id, &qn, &fp); err != nil {
 			return nil, err
 		}
-		nodePkg[id] = qnToPackage(qn)
+		if useFilePath {
+			if opts.BoundaryPathPrefix != "" && !strings.HasPrefix(fp, opts.BoundaryPathPrefix) {
+				continue
+			}
+			nodePkg[id] = filePathToSegment(fp, depth)
+		} else {
+			nodePkg[id] = qnToPackage(qn)
+		}
 	}
 	if err := nodeRows.Err(); err != nil {
 		return nil, err
@@ -421,10 +455,23 @@ func (s *Store) archBoundaries(project string) ([]CrossPkgBoundary, error) {
 		result = append(result, CrossPkgBoundary{From: k.from, To: k.to, CallCount: cnt})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CallCount > result[j].CallCount })
-	if len(result) > 10 {
-		result = result[:10]
+	if len(result) > 20 {
+		result = result[:20]
 	}
 	return result, nil
+}
+
+// filePathToSegment extracts a directory prefix of the given depth from a file path.
+// e.g., filePathToSegment("game/features/logistics/supply.ts", 2) → "game/features"
+func filePathToSegment(fp string, depth int) string {
+	parts := strings.Split(fp, "/")
+	if len(parts) <= depth {
+		if len(parts) > 1 {
+			return strings.Join(parts[:len(parts)-1], "/")
+		}
+		return ""
+	}
+	return strings.Join(parts[:depth], "/")
 }
 
 func (s *Store) archServices(project string) ([]ServiceLink, error) {
@@ -475,7 +522,7 @@ func (s *Store) archServices(project string) ([]ServiceLink, error) {
 
 func (s *Store) archLayers(project string) ([]PackageLayer, error) {
 	// Get boundaries for fan-in/out analysis
-	boundaries, err := s.archBoundaries(project)
+	boundaries, err := s.archBoundaries(project, ArchOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -567,14 +614,15 @@ func classifyLayer(_ string, in, out int, hasRoutes, hasEntryPoints bool) (layer
 
 // clusterNodeInfo holds node metadata for the clustering algorithm.
 type clusterNodeInfo struct {
-	id   int64
-	name string
-	qn   string
+	id       int64
+	name     string
+	qn       string
+	filePath string
 }
 
 func (s *Store) archClusters(project string) ([]ClusterInfo, error) {
 	// Load all function/method nodes
-	nodeRows, err := s.q.Query(`SELECT id, name, qualified_name FROM nodes WHERE project=? AND label IN ('Function', 'Method')`, project)
+	nodeRows, err := s.q.Query(`SELECT id, name, qualified_name, file_path FROM nodes WHERE project=? AND label IN ('Function', 'Method')`, project)
 	if err != nil {
 		return nil, err
 	}
@@ -584,7 +632,7 @@ func (s *Store) archClusters(project string) ([]ClusterInfo, error) {
 	nodeIDSet := map[int64]bool{}
 	for nodeRows.Next() {
 		var ni clusterNodeInfo
-		if err := nodeRows.Scan(&ni.id, &ni.name, &ni.qn); err != nil {
+		if err := nodeRows.Scan(&ni.id, &ni.name, &ni.qn, &ni.filePath); err != nil {
 			return nil, err
 		}
 		nodeList = append(nodeList, ni)
@@ -684,10 +732,50 @@ func buildClusterInfos(communities map[int][]int64, edges []louvainEdge, commEdg
 	if len(clusters) > 15 {
 		clusters = clusters[:15]
 	}
+	// Deduplicate labels: when multiple clusters share the same label,
+	// append the top node name to distinguish them.
+	deduplicateClusterLabels(clusters)
 	for i := range clusters {
 		clusters[i].ID = i + 1
 	}
 	return clusters
+}
+
+// deduplicateClusterLabels disambiguates clusters that share the same label
+// by appending a distinguishing suffix derived from the cluster's dominant
+// file name (without extension), falling back to the top fan-in node name.
+func deduplicateClusterLabels(clusters []ClusterInfo) {
+	labelCount := map[string]int{}
+	for _, c := range clusters {
+		labelCount[c.Label]++
+	}
+	for i := range clusters {
+		if labelCount[clusters[i].Label] <= 1 {
+			continue
+		}
+		suffix := clusterDistinguisher(clusters[i])
+		if suffix != "" {
+			clusters[i].Label = clusters[i].Label + " (" + suffix + ")"
+		}
+	}
+}
+
+// clusterDistinguisher returns a short string to disambiguate a cluster.
+// Prefers the most common file stem among top nodes (e.g., "board-manager")
+// over a raw function name (e.g., "debug").
+func clusterDistinguisher(c ClusterInfo) string {
+	if len(c.Packages) > 1 {
+		// Multiple packages — use the first non-generic one
+		for _, pkg := range c.Packages {
+			if !isGenericDirName(pkg) {
+				return pkg
+			}
+		}
+	}
+	if len(c.TopNodes) > 0 {
+		return c.TopNodes[0]
+	}
+	return ""
 }
 
 // buildOneCluster computes a ClusterInfo for a single community.
@@ -753,6 +841,7 @@ func buildOneCluster(commID int, members []int64, edges []louvainEdge, edgeTypes
 }
 
 func autoNameCluster(members []int64, nodeByID map[int64]clusterNodeInfo) string {
+	// First try QN-based package grouping
 	pkgCounts := map[string]int{}
 	for _, id := range members {
 		pkg := qnToPackage(nodeByID[id].qn)
@@ -760,18 +849,122 @@ func autoNameCluster(members []int64, nodeByID map[int64]clusterNodeInfo) string
 			pkgCounts[pkg]++
 		}
 	}
-	bestPkg := ""
+
+	// If there are multiple distinct packages, return the dominant one — it's already descriptive.
+	if len(pkgCounts) > 1 {
+		bestPkg := ""
+		bestCount := 0
+		for pkg, cnt := range pkgCounts {
+			if cnt > bestCount {
+				bestPkg = pkg
+				bestCount = cnt
+			}
+		}
+		if bestPkg != "" {
+			return bestPkg
+		}
+	}
+
+	// If all members share the same QN package (e.g., all "src"), try file path prefix.
+	label := clusterLabelFromFilePaths(members, nodeByID)
+	if label != "" {
+		return label
+	}
+
+	// Fall back to single QN package if we have one
+	for pkg := range pkgCounts {
+		return pkg
+	}
+	return fmt.Sprintf("cluster-%d", len(members))
+}
+
+// clusterLabelFromFilePaths derives a label from the most common sub-directory
+// among cluster member file paths. Uses a two-pass strategy:
+//  1. Try deeper prefixes (depth 3-4) with >40% coverage for specific labels.
+//  2. Fall back to the most common depth-2 directory (no threshold) for broad labels.
+//
+// This produces labels like "src/game/features/logistics" or "game" instead of
+// generic "src" for scattered clusters.
+func clusterLabelFromFilePaths(members []int64, nodeByID map[int64]clusterNodeInfo) string {
+	// Count directory prefixes at depths 4, 3, 2
+	dirCounts := map[string]int{}
+	for _, id := range members {
+		fp := nodeByID[id].filePath
+		if fp == "" {
+			continue
+		}
+		parts := strings.Split(fp, "/")
+		for d := 4; d >= 2; d-- {
+			if len(parts) > d {
+				prefix := strings.Join(parts[:d], "/")
+				dirCounts[prefix]++
+			}
+		}
+	}
+
+	if len(dirCounts) == 0 {
+		return ""
+	}
+
+	// Pass 1: Find the most specific (deepest) prefix that covers >40% of members.
+	bestDir := ""
 	bestCount := 0
-	for pkg, cnt := range pkgCounts {
-		if cnt > bestCount {
-			bestPkg = pkg
+	threshold := len(members) * 2 / 5
+	for dir, cnt := range dirCounts {
+		if cnt <= threshold {
+			continue
+		}
+		dirDepth := strings.Count(dir, "/")
+		bestDepth := strings.Count(bestDir, "/")
+		if dirDepth > bestDepth || (dirDepth == bestDepth && cnt > bestCount) {
+			bestDir = dir
 			bestCount = cnt
 		}
 	}
-	if bestPkg != "" {
-		return bestPkg
+	if bestDir != "" {
+		return bestDir
 	}
-	return fmt.Sprintf("cluster-%d", len(members))
+
+	// Pass 2: No deep prefix met threshold. Find the most common depth-2
+	// sub-directory, skipping generic top-level names like "src", "lib", "app".
+	type dirEntry struct {
+		dir   string
+		count int
+	}
+	var depth2 []dirEntry
+	for dir, cnt := range dirCounts {
+		if strings.Count(dir, "/") == 1 {
+			depth2 = append(depth2, dirEntry{dir, cnt})
+		}
+	}
+	sort.Slice(depth2, func(i, j int) bool { return depth2[i].count > depth2[j].count })
+
+	for _, de := range depth2 {
+		// Use the last segment as the label (e.g., "src/game" → "game")
+		parts := strings.Split(de.dir, "/")
+		last := parts[len(parts)-1]
+		if isGenericDirName(last) {
+			continue
+		}
+		return last
+	}
+
+	// All depth-2 dirs are generic — return the most common one's last segment
+	if len(depth2) > 0 {
+		parts := strings.Split(depth2[0].dir, "/")
+		return parts[len(parts)-1]
+	}
+	return ""
+}
+
+// isGenericDirName returns true for directory names that are too broad to be
+// meaningful cluster labels (e.g., "src", "lib", "app").
+func isGenericDirName(name string) bool {
+	switch strings.ToLower(name) {
+	case "src", "lib", "app", "pkg", "internal", "main", "dist", "build", "out", "bin", "vendor", "node_modules":
+		return true
+	}
+	return false
 }
 
 func (s *Store) archFileTree(project string) ([]FileTreeEntry, error) {

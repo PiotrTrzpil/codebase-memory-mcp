@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -342,7 +343,7 @@ func TestArchBoundaries(t *testing.T) {
 	s := setupArchTestStore(t)
 	defer s.Close()
 
-	boundaries, err := s.archBoundaries("test")
+	boundaries, err := s.archBoundaries("test", ArchOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1024,6 +1025,81 @@ func TestFindArchitectureDocsEmpty(t *testing.T) {
 	}
 	if len(docs) != 0 {
 		t.Errorf("expected 0 docs, got %d", len(docs))
+	}
+}
+
+func TestAutoNameClusterScatteredFiles(t *testing.T) {
+	// Simulate a large cluster where all members share QN package "src"
+	// but span multiple sub-directories under src/game/*
+	nodeByID := map[int64]clusterNodeInfo{}
+	var members []int64
+
+	// 10 members in src/game/board/*, 8 in src/game/player/*, 5 in src/ui/components/*
+	dirs := []struct {
+		dir   string
+		count int
+	}{
+		{"src/game/board", 10},
+		{"src/game/player", 8},
+		{"src/ui/components", 5},
+	}
+
+	id := int64(1)
+	for _, d := range dirs {
+		for i := 0; i < d.count; i++ {
+			nodeByID[id] = clusterNodeInfo{
+				qn:       fmt.Sprintf("proj.src.%s.func%d", strings.ReplaceAll(d.dir[4:], "/", "."), i),
+				filePath: fmt.Sprintf("%s/file%d.ts", d.dir, i),
+				name:     fmt.Sprintf("func%d", i),
+			}
+			members = append(members, id)
+			id++
+		}
+	}
+
+	label := autoNameCluster(members, nodeByID)
+	// Should NOT be just "src" — should pick "game" (most common depth-2 sub-dir)
+	if label == "src" {
+		t.Errorf("expected domain-specific label, got generic %q", label)
+	}
+	if label == "" {
+		t.Error("expected non-empty label")
+	}
+	t.Logf("cluster label: %q", label)
+}
+
+func TestClusterLabelFromFilePathsGenericFallback(t *testing.T) {
+	// All files under src/* with no deep common prefix
+	nodeByID := map[int64]clusterNodeInfo{
+		1: {filePath: "src/game/board.ts"},
+		2: {filePath: "src/game/player.ts"},
+		3: {filePath: "src/ui/button.ts"},
+		4: {filePath: "src/ui/modal.ts"},
+		5: {filePath: "src/server/api.ts"},
+	}
+	members := []int64{1, 2, 3, 4, 5}
+
+	label := clusterLabelFromFilePaths(members, nodeByID)
+	// "game" has 2/5=40% coverage at depth 2 — tied with "ui"
+	// Should pick one of the non-generic sub-dirs, not "src"
+	if label == "src" || label == "" {
+		t.Errorf("expected domain sub-directory, got %q", label)
+	}
+	t.Logf("label: %q", label)
+}
+
+func TestIsGenericDirName(t *testing.T) {
+	generics := []string{"src", "lib", "app", "pkg", "internal", "dist", "vendor"}
+	for _, g := range generics {
+		if !isGenericDirName(g) {
+			t.Errorf("expected %q to be generic", g)
+		}
+	}
+	specifics := []string{"game", "board", "player", "auth", "api", "features"}
+	for _, s := range specifics {
+		if isGenericDirName(s) {
+			t.Errorf("expected %q to NOT be generic", s)
+		}
 	}
 }
 

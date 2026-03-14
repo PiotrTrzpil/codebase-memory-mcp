@@ -20,10 +20,12 @@ type NodeHop struct {
 
 // EdgeInfo is a simplified edge for output.
 type EdgeInfo struct {
-	FromName   string
-	ToName     string
-	Type       string
-	Confidence float64
+	FromName           string
+	ToName             string
+	Type               string
+	Confidence         float64
+	ConfidenceBand     string // "high" (>=0.7), "medium" (>=0.45), "speculative" (<0.45)
+	ResolutionStrategy string // e.g. "exact_import", "fuzzy_name", "scope_local"
 }
 
 // BFS performs breadth-first traversal following edges of given types using a
@@ -117,7 +119,9 @@ func (s *Store) BFS(startNodeID int64, direction string, edgeTypes []string, max
 			WHERE b.hop < ?
 		)
 		SELECT DISTINCT src.name, tgt.name, e.type,
-			COALESCE(json_extract(e.properties, '$.confidence'), 0) as confidence
+			COALESCE(json_extract(e.properties, '$.confidence'), 0) as confidence,
+			COALESCE(json_extract(e.properties, '$.confidence_band'), '') as confidence_band,
+			COALESCE(json_extract(e.properties, '$.resolution_strategy'), '') as resolution_strategy
 		FROM bfs b
 		JOIN edges e ON e.%s = b.node_id AND e.type IN (%s)
 		JOIN nodes src ON src.id = e.source_id
@@ -142,7 +146,7 @@ func (s *Store) BFS(startNodeID int64, direction string, edgeTypes []string, max
 
 	for edgeRows.Next() {
 		var ei EdgeInfo
-		if err := edgeRows.Scan(&ei.FromName, &ei.ToName, &ei.Type, &ei.Confidence); err != nil {
+		if err := edgeRows.Scan(&ei.FromName, &ei.ToName, &ei.Type, &ei.Confidence, &ei.ConfidenceBand, &ei.ResolutionStrategy); err != nil {
 			return nil, err
 		}
 		result.Edges = append(result.Edges, ei)
