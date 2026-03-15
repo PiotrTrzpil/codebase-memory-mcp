@@ -4,7 +4,7 @@
 
 Single Go binary. No Docker, no external databases, no API keys. One command to install, say *"Index this project"* — done.
 
-Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/), extracts functions, classes, modules, call relationships, and cross-service HTTP links. Exposes the graph through 12 MCP tools for use with Claude Code, Codex CLI, Cursor, Windsurf, Gemini CLI, VS Code, Zed, or any MCP-compatible client. Also includes a **CLI mode** for direct tool invocation from the shell — no MCP client needed.
+Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/), extracts functions, classes, modules, call relationships, and cross-service HTTP links. Exposes the graph through 14 MCP tools for use with Claude Code, Codex CLI, Cursor, Windsurf, Gemini CLI, VS Code, Zed, or any MCP-compatible client. Also includes a **CLI mode** for direct tool invocation from the shell — no MCP client needed.
 
 ## Features
 
@@ -12,6 +12,8 @@ Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/
 - **Architecture overview**: `get_architecture` returns languages, packages, entry points, routes, hotspots, boundaries, layers, and clusters in a single call — instant codebase orientation
 - **Architecture Decision Records**: `manage_adr` persists architectural decisions (PURPOSE, STACK, ARCHITECTURE, PATTERNS, TRADEOFFS, PHILOSOPHY) across sessions with section filtering and validation
 - **Louvain community detection**: Discovers hidden functional modules across packages by clustering CALLS, HTTP_CALLS, and ASYNC_CALLS edges
+- **Semantic diff**: `semantic_diff` compares old and new file versions at the AST level — detects added/removed/renamed symbols, signature changes, breaking changes, and traces downstream impact via the graph
+- **Commit planning**: `plan_commits` analyzes changes and suggests how to split them into logical commits using graph-derived coupling, with draft messages ready for use
 - **Git diff impact mapping**: `detect_changes` maps uncommitted changes to affected graph symbols + blast radius with risk classification (CRITICAL/HIGH/MEDIUM/LOW)
 - **Risk-classified tracing**: `trace_call_path` with `risk_labels=true` adds impact classification to every node in the call chain
 - **Case-insensitive search**: `search_graph` and `search_code` are case-insensitive by default — set `case_sensitive=true` for exact matching
@@ -243,7 +245,7 @@ Add the MCP server to your project's `.mcp.json` (per-project, recommended) or `
 }
 ```
 
-Restart Claude Code after adding the config. Verify with `/mcp` — you should see `codebase-memory-mcp` listed with 12 tools.
+Restart Claude Code after adding the config. Verify with `/mcp` — you should see `codebase-memory-mcp` listed with 14 tools.
 
 </details>
 
@@ -343,6 +345,8 @@ The CLI uses the same SQLite database as the MCP server (`~/.cache/codebase-memo
 | `get_code_snippet` | `qualified_name` (required) | Read source code for a function by its qualified name (reads from disk). See [Qualified Names](#qualified-names) for the format. |
 | `get_architecture` | `aspects` (array, default `["all"]`), `project` | Codebase architecture overview computed from the code graph. Aspects: `languages`, `packages`, `entry_points`, `routes`, `hotspots`, `boundaries`, `services`, `layers` (heuristic), `clusters` (Louvain community detection), `file_tree`, `adr` (stored Architecture Decision Record). Call with `["all"]` for full orientation. |
 | `manage_adr` | `mode` (required: `get`/`store`/`update`/`delete`), `project`, `content`, `sections` | CRUD for Architecture Decision Records. `get`: retrieve ADR with parsed sections. `store`: create/replace full ADR (max 8000 chars). `update`: patch specific sections (unmentioned preserved). `delete`: remove ADR. Fixed sections: PURPOSE, STACK, ARCHITECTURE, PATTERNS, TRADEOFFS, PHILOSOPHY. |
+| `semantic_diff` | `scope` (unstaged/staged/all/branch/commits), `base_branch`, `to_ref`, `depth` (1-5, default 3), `max_impact` (default 50), `include_impact` (default true), `breaking_only`, `labels`, `file_pattern`, `summary_only`, `project` | AST-level structural diff of changed files. Detects added/removed/renamed symbols, signature changes, visibility changes, and body-only changes. Flags breaking changes for exported symbols. Optionally traces downstream impact via the graph. Filter by label, file pattern, or breaking-only. Requires git in PATH. |
+| `plan_commits` | `scope` (unstaged/staged/all/branch/commits), `base_branch`, `to_ref`, `project` | Analyze changes and suggest how to split them into logical commits. Uses graph relationships to group coupled changes (e.g., signature change + caller updates). Produces compact output with draft commit messages. Requires git in PATH. |
 
 ### File Access
 
@@ -452,6 +456,33 @@ trace_call_path(function_name="ProcessOrder", direction="inbound", depth=3, risk
 detect_changes()
 detect_changes(scope="staged")
 detect_changes(scope="branch", base_branch="main", depth=3)
+```
+
+### Semantic diff (AST-level change analysis)
+
+```
+semantic_diff()
+semantic_diff(scope="staged")
+semantic_diff(scope="branch", base_branch="main")
+semantic_diff(scope="commits", base_branch="v1.0.0", to_ref="v2.0.0")
+
+# Only breaking changes
+semantic_diff(breaking_only=true)
+
+# Filter by symbol type and file pattern
+semantic_diff(labels="Function,Method", file_pattern="internal/**/*.go")
+
+# Quick summary without full details
+semantic_diff(summary_only=true)
+```
+
+### Plan commits (split changes into logical commits)
+
+```
+plan_commits()
+plan_commits(scope="staged")
+plan_commits(scope="branch", base_branch="main")
+plan_commits(scope="commits", base_branch="HEAD~5", to_ref="HEAD")
 ```
 
 ### Dead code detection
@@ -711,7 +742,8 @@ internal/
   httplink/               Cross-service HTTP route/call-site matching
   cypher/                 Cypher query lexer, parser, planner, executor
   selfupdate/             GitHub release checking, version comparison, asset download
-  tools/                  MCP tool handlers (12 tools) + CLI dispatch
+  semdiff/                AST-level semantic diff engine, breaking change classification, commit planning
+  tools/                  MCP tool handlers (14 tools) + CLI dispatch
   watcher/                Background auto-sync (mtime+size polling, adaptive intervals)
   discover/               File discovery with .cgrignore support
   fqn/                    Qualified name computation
